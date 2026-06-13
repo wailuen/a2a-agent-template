@@ -7,8 +7,8 @@ export const meta = {
     { title: 'Implement',      detail: 'Fan out todos per group in dependency order; smoke test each' },
     { title: 'Unit Redteam',   detail: 'Per-group zero-tolerance fix loop (max 5 rounds/group; debug fires at r3+ and on stall)' },
     { title: 'Phase Redteam',  detail: 'Full-wave zero-tolerance fix loop (max 8 rounds; debug fires at r3+ and on stall)' },
-    { title: 'Protocol Audit', detail: 'A2A/MCP/AG-UI/A2UI conformance — parallel advisors + seam check (protocol-surface waves only)' },
-    { title: 'Codify',         detail: 'Parallel LRN capture for critical/high findings; sequential C-NNN registration for new component candidates' },
+    { title: 'Protocol Audit', detail: 'A2A + MCP + AG-UI + A2UI conformance — one dedicated advisor per protocol in parallel + seam check (protocol-surface waves only)' },
+    { title: 'Codify',         detail: 'Parallel LRN capture for critical/high findings; sequential C-NNN registration; SDK issue scan writes workspace/sdk-candidates.md for /sdk-issue-scan' },
     { title: 'Archive',        detail: 'Move wave file to completed/, update plan.md, backfill FR Implementation: fields' },
   ],
 }
@@ -20,8 +20,8 @@ const WAVE_FILE = args.waveFile
 const TODAY     = args.today || '(see context date)'
 
 // ─── protocol surface paths (trigger the Protocol Audit phase) ─────────────────
-const A2A_SURFACE  = ['src/routes/a2a', 'src/routes/mcp', 'src/routes/oauth',
-                      'src/routes/agent_card', 'src/models/a2a']
+const A2A_SURFACE  = ['src/routes/a2a', 'src/routes/agent_card', 'src/models/a2a']
+const MCP_SURFACE  = ['src/routes/mcp', 'src/routes/oauth']
 const AGUI_SURFACE = ['src/routes/ag_ui']
 const A2UI_SURFACE = ['src/a2ui/', 'src/models/content_types']
 
@@ -167,6 +167,30 @@ const PLAN_RT_SCHEMA = {
           name:        { type: 'string' },
           location:    { type: 'string' },
           description: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+// SDK issue scan schema — classifies findings as SDK-level vs agent-domain
+const SDK_SCAN_SCHEMA = {
+  type: 'object',
+  required: ['sdkCandidates'],
+  additionalProperties: false,
+  properties: {
+    sdkCandidates: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['description', 'severity', 'component', 'rationale'],
+        additionalProperties: false,
+        properties: {
+          description: { type: 'string' },
+          severity:    { type: 'string' },
+          component:   { type: 'string' },
+          rationale:   { type: 'string' },
+          file:        { type: 'string' },
         },
       },
     },
@@ -501,38 +525,54 @@ phase('Protocol Audit')
 const runA2A  = wave.allCreates.some(function(p) {
   return A2A_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
 })
+const runMCP  = wave.allCreates.some(function(p) {
+  return MCP_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
+})
 const runAGUI = wave.allCreates.some(function(p) {
   return AGUI_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
 })
 const runA2UI = wave.allCreates.some(function(p) {
   return A2UI_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
 })
-const runProtocol = runA2A || runAGUI || runA2UI
+const runProtocol = runA2A || runMCP || runAGUI || runA2UI
 
 if (!runProtocol) {
   log('Protocol audit skipped — no protocol surfaces in creates list')
 } else {
-  log('Protocol audit triggered (A2A=' + runA2A + ' AG-UI=' + runAGUI + ' A2UI=' + runA2UI + ')')
-  // AD-001: advisor agents are external (check kit). If the kit is absent they fall back to
-  // the default agent and results will be incomplete — log what we expect so the user can verify.
-  log('Protocol audit: requires a2a-advisor / ag-ui-advisor / a2ui-advisor from the check kit. ' +
-      'If the kit is absent, advisor legs return partial or empty results — NOT a green pass.')
+  log('Protocol audit triggered (A2A=' + runA2A + ' MCP=' + runMCP + ' AG-UI=' + runAGUI + ' A2UI=' + runA2UI + ')')
+  log('Protocol audit: dispatches a2a-advisor / mcp-advisor / ag-ui-advisor / a2ui-advisor — each protocol gets its own advisor (no single-advisor collapse).')
 
   const advisorTasks = []
 
   if (runA2A) {
     advisorTasks.push(function() {
       return agent(
-        'A2A v0.3.0 + MCP conformance audit.\n\n' +
+        'A2A v0.3.0 conformance audit.\n\n' +
         'Files to audit:\n' +
         wave.allCreates.filter(function(p) {
           return A2A_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
         }).join('\n') + '\n\n' +
         'Check: agent card shape, task/message/part/artifact shapes, streaming,\n' +
-        'error codes (-32001 through -32007 → correct HTTP status), auth,\n' +
-        'MCP Streamable-HTTP transport, OAuth 2.1 routes.\n\n' +
-        'Return structured findings. Set protocol="A2A" or "MCP" per finding.',
+        'error codes (-32001 through -32007 → correct HTTP status), auth surface.\n\n' +
+        'Return structured findings. Set protocol="A2A" per finding.',
         { schema: PROTO_SCHEMA, agentType: 'a2a-advisor', label: 'proto:a2a', phase: 'Protocol Audit' }
+      )
+    })
+  }
+
+  if (runMCP) {
+    advisorTasks.push(function() {
+      return agent(
+        'MCP server + Claude.ai connector conformance audit.\n\n' +
+        'Files to audit:\n' +
+        wave.allCreates.filter(function(p) {
+          return MCP_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
+        }).join('\n') + '\n\n' +
+        'Check: Streamable-HTTP transport, OAuth 2.1 discovery chain (PRM + AS metadata),\n' +
+        'PKCE S256, token aud binding, CORS (claude.ai origin + WWW-Authenticate exposure),\n' +
+        'initialize echo, tools/list shape, isError vs JSON-RPC error split.\n\n' +
+        'Return structured findings. Set protocol="MCP" per finding.',
+        { schema: PROTO_SCHEMA, agentType: 'mcp-advisor', label: 'proto:mcp', phase: 'Protocol Audit' }
       )
     })
   }
@@ -630,10 +670,20 @@ if (!runProtocol) {
     if (runA2A) {
       recheckTasks.push(function() {
         return agent(
-          'A2A v0.3.0 + MCP re-audit after preceding fix. Check same surfaces.\n' +
+          'A2A v0.3.0 re-audit after preceding fix. Check same surfaces.\n' +
           'Creates paths:\n' + wave.allCreates.join('\n') + '\n' +
           'Focus on previously-critical findings. Return structured findings.',
           { schema: PROTO_SCHEMA, agentType: 'a2a-advisor', label: 'proto:recheck:a2a', phase: 'Protocol Audit' }
+        )
+      })
+    }
+    if (runMCP) {
+      recheckTasks.push(function() {
+        return agent(
+          'MCP server re-audit after preceding fix. Check same surfaces.\n' +
+          'Creates paths:\n' + wave.allCreates.join('\n') + '\n' +
+          'Focus on previously-critical findings. Return structured findings.',
+          { schema: PROTO_SCHEMA, agentType: 'mcp-advisor', label: 'proto:recheck:mcp', phase: 'Protocol Audit' }
         )
       })
     }
@@ -757,6 +807,55 @@ if (registryCandidates.length > 0) {
     'Do NOT modify existing rows. Append only. Report: IDs assigned and their locations.',
     { label: 'registry:register', phase: 'Codify' }
   )
+}
+
+// ─── SDK issue scan (end of Codify) ──────────────────────────────────────────
+// Classify critical/high findings as SDK-level vs agent-domain.
+// SDK-level ones are written to workspace/sdk-candidates.md for /sdk-issue-scan.
+if (toCodeify.length > 0) {
+  const sdkScan = await agent(
+    'Classify each finding as SDK-level or agent-domain.\n\n' +
+    'SDK-LEVEL (include in output):\n' +
+    '- Harness: wrong step in a SKILL.md, wrong agent instruction, wave-cycle.js logic error\n' +
+    '- SDK internals: build_app(), Agent, ToolSet, SourceAdapter base class, credential store, loop\n' +
+    '- Protocol surface: wrong HTTP status, missing handler, wrong shape in src/routes/\n' +
+    '- Template scaffold: wrong pattern shown in template/, wrong SDK API in an example\n' +
+    '- Security: an SI violation that the SDK itself causes (not domain code)\n\n' +
+    'AGENT-DOMAIN (exclude):\n' +
+    '- src/tools/, src/sources/, src/config.py, src/persona.py\n' +
+    '- Agent-specific credential setup, domain test failures\n' +
+    '- An SI violation in the agent\'s domain code (fix the code, not the SDK)\n\n' +
+    'For each SDK-level finding, assign a component:\n' +
+    'harness/skill | harness/workflow | harness/agent | harness/template |\n' +
+    'sdk/build | sdk/loop | sdk/credentials | sdk/console |\n' +
+    'protocol/a2a | protocol/mcp | protocol/ag-ui | protocol/a2ui | protocol/oauth | security\n\n' +
+    'Findings to classify:\n' + JSON.stringify(toCodeify, null, 2),
+    { schema: SDK_SCAN_SCHEMA, label: 'sdk:scan', phase: 'Codify' }
+  )
+
+  if (sdkScan && sdkScan.sdkCandidates.length > 0) {
+    const candidateLines = sdkScan.sdkCandidates.map(function(c, i) {
+      return '## Candidate ' + (i + 1) + ': ' + c.description + '\n' +
+             '- Severity: ' + c.severity + '\n' +
+             '- Component: ' + c.component + '\n' +
+             '- File: ' + (c.file || 'n/a') + '\n' +
+             '- Rationale: ' + c.rationale
+    }).join('\n\n')
+
+    await agent(
+      'Write the file workspace/sdk-candidates.md with exactly this content:\n\n' +
+      '# SDK issue candidates — ' + wave.waveId + ' (' + TODAY + ')\n\n' +
+      'These critical/high findings from wave ' + wave.waveId + ' are classified as\n' +
+      'SDK-level. Run `/sdk-issue-scan` to review and file them as GitHub issues\n' +
+      'on `wailuen/a2a-sdk`. One confirmation per filing — nothing is filed automatically.\n\n' +
+      candidateLines,
+      { label: 'sdk:candidates', phase: 'Codify' }
+    )
+    log('SDK issue candidates: ' + sdkScan.sdkCandidates.length + ' finding(s) written to workspace/sdk-candidates.md')
+    log('Run /sdk-issue-scan to file them as GitHub issues on wailuen/a2a-sdk')
+  } else {
+    log('SDK issue scan: no SDK-level findings in this wave')
+  }
 }
 
 // ─── phase 7: archive ─────────────────────────────────────────────────────────

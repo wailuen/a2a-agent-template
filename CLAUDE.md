@@ -20,6 +20,46 @@ No features the PRD doesn't mention. When in doubt, read the code.
 | `codify` | After any non-obvious root cause — capture the LRN |
 | `sdk-advisor` | Questions about SDK conventions, extension points, invariants |
 | `python-implementer` | Writing or fixing Python source files |
+| `a2a-advisor` | A2A v0.3.0 conformance questions, design, and remediation |
+| `mcp-advisor` | MCP server build advice and Claude.ai connector conformance |
+| `a2ui-advisor` | A2UI protocol + Standard Profile v1 spec and conformance |
+| `ag-ui-advisor` | AG-UI event catalog, SSE transport, GenUI mode wiring |
+
+**Workflow skills (development loop):**
+
+| Skill | When to use |
+|---|---|
+| `/provision` | First-time agent setup — installs deps, seeds workspace |
+| `/setup` | Assign port, set env vars |
+| `/todos` | Break work into a typed wave plan |
+| `/wave` | Execute one wave end-to-end (implement → redteam → protocol audit → archive) |
+| `/implement` | Implement a single todo with tests |
+| `/redteam` | Adversarial review against spec (runs inside `/wave` automatically) |
+| `/agent-verify` | Boot agent + full-stack conformance + OAuth-chain probes |
+| `/acceptance` | Run JTBD scenario acceptance suite |
+| `/add-tool` | Scaffold a new tool + adapter |
+| `/add-source` | Scaffold a new SourceAdapter |
+| `/add-artifact` | Migrate a hardcoded persona to `src/artifacts/system.md` |
+| `/upgrade` | Sync harness files to a new SDK version |
+| `/analyze` | Produce a gap analysis for a new capability |
+| `/codify` | Capture a root cause as a permanent LRN |
+| `/debug` | Root-cause a failing test or tool error |
+| `/diagnose` | Triage unexpected agent behaviour |
+| `/migrate` | Cross-wave refactor planning |
+| `/scenario` | Draft a new JTBD acceptance scenario |
+| `/changelog` | Generate release notes for a version bump |
+| `/sdk-issue` | File a confirmed SDK bug or enhancement as a GitHub issue |
+| `/sdk-issue-scan` | Batch-file SDK-level findings from a wave or redteam; reads `workspace/sdk-candidates.md` |
+
+**Compliance skills (protocol conformance audits):**
+
+| Skill | When to use |
+|---|---|
+| `/agent-stack-check` | Full-stack interop audit — MCP + A2A + AG-UI + A2UI in one pass |
+| `/a2a-check` | A2A v0.3.0 conformance sweep (server + consumer roles) |
+| `/mcp-check` | MCP server + Claude.ai connector conformance |
+| `/ag-ui-check` | AG-UI event and transport conformance |
+| `/a2ui-check` | A2UI protocol v0.9.1 + Standard Profile v1 conformance |
 
 **Core disciplines:**
 
@@ -108,8 +148,11 @@ Run after adding tools, sources, or settings:
 # Boot check
 DEV_MODE=true uvicorn src.main:app --port 8000 --workers 1
 
-# Protocol smoke
+# Protocol smoke (boots agent, runs full-stack conformance + OAuth-chain probes)
 /agent-verify
+
+# Conformance-only (no boot — static + optional live)
+/agent-stack-check
 
 # Full wave
 /wave w001
