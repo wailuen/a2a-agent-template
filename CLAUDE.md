@@ -135,6 +135,28 @@ Full grep checks in `.claude/reference/sdk-security-invariants.md`.
 
 Never put upstream keys in `.env`. Never log either key.
 
+## Credential ADR discipline (enforced by hook)
+
+Every credential seeded during development must be recorded in the workspace ADR.
+This is enforced by a `PostToolUse` hook in `.claude/settings.json` that fires
+whenever a credential is written via the admin API.
+
+**Rule:** After ANY of the following, immediately update
+`workspace/adr/ADR-001-<env>-credentials.md`:
+- `PUT /admin/api/credentials/<namespace>/<field>` (source, model, bedrock)
+- `/provision` (writes ADR-001 automatically in Phase 3d)
+- Manual credential rotation via the admin console
+
+**What to record:** namespace + field name + set status. **Never the value.**
+
+```markdown
+| alphageo  | api_key           | ✓ |
+| __model__ | openai_api_key    | ✓ |
+```
+
+`workspace/adr/ADR-001-*-credentials.md` is gitignored (same as ADR-000).
+If the file does not exist, create it from the template in `/provision` Phase 3d.
+
 ## Workspace layout
 
 ```
