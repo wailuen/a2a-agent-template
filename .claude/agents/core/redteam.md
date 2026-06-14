@@ -132,7 +132,8 @@ Called with labels `rt:unit:*` and `rt:phase:*`. Return:
       "file": "src/tools/fetch.py",
       "description": "one-sentence description",
       "fix": "what to change",
-      "codify": "one-sentence lesson (required for critical/high)"
+      "codify": "one-sentence lesson (required for critical/high)",
+      "sdkCandidate": true
     }
   ]
 }
