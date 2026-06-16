@@ -1,14 +1,14 @@
 export const meta = {
   name: 'wave-cycle',
-  description: 'Execute one wave: todos plan redteam (SI annotations + registry reuse) → fan-out implement per group → unit zero-tolerance redteam (debug at r3+ and on stall) → phase zero-tolerance redteam (debug at r3+ and on stall) → protocol audit → codify LRNs + register new C-NNN components → archive',
+  description: 'Execute one wave: todos plan redteam (SI annotations + registry reuse) → fan-out implement per group → unit zero-tolerance redteam (debug after >3 failed rounds (r4+) and on stall) → phase zero-tolerance redteam (debug after >3 failed rounds (r4+) and on stall) → protocol audit → codify LRNs + register new C-NNN components → archive',
   phases: [
     { title: 'Parse',          detail: 'Read wave file; extract groups, creates paths, LRN baseline' },
     { title: 'Todos Redteam',  detail: 'Redteam the wave plan: SI risk annotation, registry reuse (Reuses: C-NNN), new component candidate flagging — annotated wave file written back before implement' },
     { title: 'Implement',      detail: 'Fan out todos per group in dependency order; smoke test each' },
-    { title: 'Unit Redteam',   detail: 'Per-group zero-tolerance fix loop (max 5 rounds/group; debug fires at r3+ and on stall)' },
-    { title: 'Phase Redteam',  detail: 'Full-wave zero-tolerance fix loop (max 8 rounds; debug fires at r3+ and on stall)' },
-    { title: 'Protocol Audit', detail: 'A2A + MCP + AG-UI + A2UI conformance — one dedicated advisor per protocol in parallel + seam check (protocol-surface waves only)' },
-    { title: 'Codify',         detail: 'Parallel LRN capture for critical/high findings; sequential C-NNN registration; SDK issue scan writes workspace/sdk-candidates.md for /sdk-issue-scan' },
+    { title: 'Unit Redteam',   detail: 'Per-group zero-tolerance fix loop (max 5 rounds/group; debug fires after >3 failed rounds (r4+) and on stall)' },
+    { title: 'Phase Redteam',  detail: 'Full-wave zero-tolerance fix loop (max 8 rounds; debug fires after >3 failed rounds (r4+) and on stall)' },
+    { title: 'Protocol Audit', detail: 'A2A/MCP/AG-UI/A2UI conformance — parallel advisors + seam check (protocol-surface waves only)' },
+    { title: 'Codify',         detail: 'SDK issue scan (sequential) → parallel LRN capture for critical/high findings → README index update → sequential C-NNN registration for new component candidates' },
     { title: 'Archive',        detail: 'Move wave file to completed/, update plan.md, backfill FR Implementation: fields' },
   ],
 }
@@ -107,6 +107,7 @@ const PROTO_SCHEMA = {
           severity:    { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
           rule:        { type: 'string' },
           description: { type: 'string' },
+          fix:         { type: 'string' },
           codify:      { type: 'string' },
         },
       },
@@ -198,6 +199,19 @@ const SDK_SCAN_SCHEMA = {
   },
 }
 
+// GH-19: pytest gate schema — exit code + failure list consumed to block fix loops
+const GATE_SCHEMA = {
+  type: 'object',
+  required: ['exitCode', 'passCount', 'failCount', 'failures'],
+  additionalProperties: false,
+  properties: {
+    exitCode:  { type: 'number' },
+    passCount: { type: 'number' },
+    failCount: { type: 'number' },
+    failures:  { type: 'array', items: { type: 'string' } },
+  },
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 // Stall detection uses description (not id) because agents re-derive ids each round.
@@ -245,7 +259,9 @@ log('Wave ' + wave.waveId + ': ' + wave.groups.length + ' group(s), ' +
 const lrnBase          = wave.lrnNext
 const allHighFindings  = []   // accumulates critical/high for codify phase
 let   protocolBlocked  = false
+let   testsRed         = false
 let   totalTodos       = 0
+let   sdkCandidatesCount = 0   // set by sdk:scan in Codify phase
 
 // ─── phase 1: todos redteam ───────────────────────────────────────────────────
 phase('Todos Redteam')
@@ -335,8 +351,10 @@ for (const group of wave.groups) {
       'serialisation), write the failing test FIRST (confirm RED), then the code\n' +
       '(confirm GREEN), then refactor. The todo is not done until the test was RED.\n\n' +
       'Todo:\n' + todo.body + '\n\n' +
-      'After implementing, run: pytest -q tests/ (scope to changed files if possible).\n' +
-      'Report: files created/modified, test count, any blockers.',
+      'You MAY run scoped tests (`python -m pytest -q tests/test_<specific>.py`) to confirm\n' +
+      'RED→GREEN for your own files. Do NOT run the full test suite — a centralized gate\n' +
+      'runs after all groups finish and will catch suite-wide regressions.\n' +
+      'Report: files created/modified, RED→GREEN confirmation, any blockers.',
       { label: 'impl:' + todo.id, phase: 'Implement', agentType: 'python-implementer' }
     )
   } else {
@@ -352,7 +370,9 @@ for (const group of wave.groups) {
           'SI-6: vendor keys in credential store only; SI-7: non-empty allowed_hosts.\n\n' +
           'Test-first for correctness-bearing code (RED then GREEN then refactor).\n\n' +
           'Todo:\n' + todo.body + '\n\n' +
-          'Run: pytest -q tests/ after implementing. Report: files created/modified, test count.',
+          'You MAY run scoped tests (`python -m pytest -q tests/test_<specific>.py`) to confirm\n' +
+          'RED→GREEN for your own files. Do NOT run the full test suite — a centralized gate\n' +
+          'runs after all groups finish. Report: files created/modified, RED→GREEN confirmation.',
           { label: 'impl:' + todo.id, phase: 'Implement', agentType: 'python-implementer' }
         )
       }
@@ -407,8 +427,8 @@ for (const group of wave.groups) {
     }
 
     // Debug fires at rounds 3–4 (unconditionally) and whenever stalled; round 5 exits above.
-    if (uRound >= 3 || stalled) {
-      log((stalled ? 'Stall detected — ' : 'Round 3+ — ') + 'escalating to debug agent')
+    if (uRound > 3 || stalled) {
+      log((stalled ? 'Stall detected — ' : 'Round 4+ — ') + 'escalating to debug agent')
       await agent(
         'Fix-loop requires fresh-lens analysis' + (stalled ? ' (stalled: same findings across 2 rounds)' : ' (round ' + uRound + ')') + '.\n\n' +
         'Prior findings:\n' + JSON.stringify(rt.findings, null, 2) + '\n\n' +
@@ -432,7 +452,7 @@ for (const group of wave.groups) {
         return agent(
           'Fix these findings in ' + file + ':\n\n' +
           JSON.stringify(byFile[file], null, 2) + '\n\n' +
-          'Enforce SDK SI-1…SI-7 in your fix. Run pytest -q tests/ after.',
+          'Enforce SDK SI-1…SI-7 in your fix. Run pytest -q after.',
           { label: 'fix:unit:' + group.label + ':r' + uRound + ':' + file.replace(/\//g, '-'),
             phase: 'Unit Redteam', agentType: 'python-implementer' }
         )
@@ -444,6 +464,24 @@ for (const group of wave.groups) {
     })
     allHighFindings.push.apply(allHighFindings, highFindings)
     await parallel(fixTasks)
+
+    // GH-19: consume gate result — red suite blocks loop continuation
+    const unitGate = await agent(
+      'Run: python -m pytest -q\n' +
+      'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
+      '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
+      { schema: GATE_SCHEMA, label: 'gate:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam' }
+    )
+    if (unitGate && unitGate.exitCode !== 0) {
+      testsRed = true
+      log('Gate RED (' + unitGate.failCount + ' failing) — dispatching test-fix agent')
+      await agent(
+        'Fix the failing tests below. Read the test file and the source it covers.\n' +
+        'Failing tests:\n' + unitGate.failures.join('\n') + '\n\n' +
+        'Run `python -m pytest -q <failing-test-file>` to confirm GREEN before finishing.',
+        { label: 'fix:tests:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam' }
+      )
+    }
   }
 }
 
@@ -484,8 +522,8 @@ while (true) {
   }
 
   // Debug fires at rounds 3–7 (unconditionally) and whenever stalled; round 8 exits above.
-  if (pRound >= 3 || pStalled) {
-    log((pStalled ? 'Stall detected — ' : 'Round 3+ — ') + 'escalating to debug agent')
+  if (pRound > 3 || pStalled) {
+    log((pStalled ? 'Stall detected — ' : 'Round 4+ — ') + 'escalating to debug agent')
     await agent(
       'Phase fix-loop requires fresh-lens analysis' + (pStalled ? ' (stalled)' : ' (round ' + pRound + ')') + '.\n\n' +
       'Findings:\n' + JSON.stringify(rt.findings, null, 2) + '\n\n' +
@@ -506,7 +544,7 @@ while (true) {
     return function() {
       return agent(
         'Fix findings in ' + file + ':\n\n' + JSON.stringify(byFile[file], null, 2) + '\n\n' +
-        'Enforce SI-1…SI-7. Run pytest -q tests/ after.',
+        'Enforce SI-1…SI-7. Run pytest -q after.',
         { label: 'fix:phase:r' + pRound + ':' + file.replace(/\//g, '-'),
           phase: 'Phase Redteam', agentType: 'python-implementer' }
       )
@@ -518,6 +556,24 @@ while (true) {
   })
   allHighFindings.push.apply(allHighFindings, highFindings)
   await parallel(fixTasks)
+
+  // GH-19: consume gate result — red suite blocks loop continuation
+  const phaseGate = await agent(
+    'Run: python -m pytest -q\n' +
+    'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
+    '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
+    { schema: GATE_SCHEMA, label: 'gate:phase:r' + pRound, phase: 'Phase Redteam' }
+  )
+  if (phaseGate && phaseGate.exitCode !== 0) {
+    testsRed = true
+    log('Gate RED (' + phaseGate.failCount + ' failing) — dispatching test-fix agent')
+    await agent(
+      'Fix the failing tests below. Read the test file and the source it covers.\n' +
+      'Failing tests:\n' + phaseGate.failures.join('\n') + '\n\n' +
+      'Run `python -m pytest -q <failing-test-file>` to confirm GREEN before finishing.',
+      { label: 'fix:tests:phase:r' + pRound, phase: 'Phase Redteam' }
+    )
+  }
 }
 
 // ─── phase 5: protocol audit ──────────────────────────────────────────────────
@@ -541,7 +597,10 @@ if (!runProtocol) {
   log('Protocol audit skipped — no protocol surfaces in creates list')
 } else {
   log('Protocol audit triggered (A2A=' + runA2A + ' MCP=' + runMCP + ' AG-UI=' + runAGUI + ' A2UI=' + runA2UI + ')')
-  log('Protocol audit: dispatches a2a-advisor / mcp-advisor / ag-ui-advisor / a2ui-advisor — each protocol gets its own advisor (no single-advisor collapse).')
+  // AD-001: advisor agents are external (check kit). If the kit is absent they fall back to
+  // the default agent and results will be incomplete — log what we expect so the user can verify.
+  log('Protocol audit: requires a2a-advisor / mcp-advisor / ag-ui-advisor / a2ui-advisor from the check kit. ' +
+      'If the kit is absent, advisor legs return partial or empty results — NOT a green pass.')
 
   const advisorTasks = []
 
@@ -554,7 +613,7 @@ if (!runProtocol) {
           return A2A_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
         }).join('\n') + '\n\n' +
         'Check: agent card shape, task/message/part/artifact shapes, streaming,\n' +
-        'error codes (-32001 through -32007 → correct HTTP status), auth surface.\n\n' +
+        'error codes (-32001 through -32007 → correct HTTP status), auth.\n\n' +
         'Return structured findings. Set protocol="A2A" per finding.',
         { schema: PROTO_SCHEMA, agentType: 'a2a-advisor', label: 'proto:a2a', phase: 'Protocol Audit' }
       )
@@ -564,14 +623,15 @@ if (!runProtocol) {
   if (runMCP) {
     advisorTasks.push(function() {
       return agent(
-        'MCP server + Claude.ai connector conformance audit.\n\n' +
+        'MCP conformance audit.\n\n' +
         'Files to audit:\n' +
         wave.allCreates.filter(function(p) {
           return MCP_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
         }).join('\n') + '\n\n' +
-        'Check: Streamable-HTTP transport, OAuth 2.1 discovery chain (PRM + AS metadata),\n' +
-        'PKCE S256, token aud binding, CORS (claude.ai origin + WWW-Authenticate exposure),\n' +
-        'initialize echo, tools/list shape, isError vs JSON-RPC error split.\n\n' +
+        'Check: Streamable-HTTP transport, OAuth 2.1 discovery (/.well-known/oauth-authorization-server),\n' +
+        'PKCE (S256, code_challenge_method), initialize request/response echo (protocolVersion,\n' +
+        'serverInfo, capabilities), tools/list shape (name, description, inputSchema),\n' +
+        'token endpoint CORS, and auth error codes.\n\n' +
         'Return structured findings. Set protocol="MCP" per finding.',
         { schema: PROTO_SCHEMA, agentType: 'mcp-advisor', label: 'proto:mcp', phase: 'Protocol Audit' }
       )
@@ -603,7 +663,7 @@ if (!runProtocol) {
           return A2UI_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
         }).join('\n') + '\n\n' +
         'Check: createSurface/updateComponents/updateDataModel/deleteSurface shapes,\n' +
-        'Core 7 + Extended 11 Standard Profile types only, JSON-Pointer binding,\n' +
+        'Core 6 + Extended 8 Standard Profile types only (14 FROZEN total; 4 RESERVED names are never emitted), JSON-Pointer binding,\n' +
         'A2A DataPart delivery, translator.py message types, field contracts.\n\n' +
         'Return structured findings. Set protocol="A2UI" per finding.',
         { schema: PROTO_SCHEMA, agentType: 'a2ui-advisor', label: 'proto:a2ui', phase: 'Protocol Audit' }
@@ -620,11 +680,11 @@ if (!runProtocol) {
       'src/routes/oauth.py, and any AG-UI/A2UI route files in the creates list.\n\n' +
       'Wave creates paths:\n' + wave.allCreates.join('\n') + '\n\n' +
       'Check:\n' +
-      '- Agent card skills array matches every SKILL.md in src/skills/.\n' +
+      '- Agent card skills array contains one entry per @tool in the ToolRegistry (no tool advertised in the card is absent from the registry).\n' +
+      '- src/skills/*.md files are reachable via the load_skill tool (skills_dir is wired in the Agent constructor); these are separate from the card\'s skills[] and no 1:1 count match is required.\n' +
       '- Agent card streaming flag matches actual SSE implementation.\n' +
       '- Auth mode enforced uniformly: no surface accepts a token type another rejects.\n' +
-      '- Version strings identical across agent card, MCP server info, health endpoint.\n' +
-      '- No tool advertised in the agent card is absent from the tool registry.\n\n' +
+      '- Version strings identical across agent card, MCP server info, health endpoint.\n\n' +
       'Return structured findings. Set protocol="SEAM" per finding.',
       { schema: PROTO_SCHEMA, label: 'proto:seam', phase: 'Protocol Audit' }
     )
@@ -648,7 +708,7 @@ if (!runProtocol) {
         severity:    f.severity,
         file:        'protocol-surface',
         description: f.description,
-        fix:         f.description,
+        fix:         f.fix || ('See protocol-audit findings for ' + f.protocol + ' rule ' + f.rule),
         codify:      f.codify,
       }
     })
@@ -662,9 +722,27 @@ if (!runProtocol) {
         allProtoFindings.filter(function(f) { return f.severity === 'critical' }),
         null, 2
       ) + '\n\n' +
-      'Run pytest -q tests/ after fixing. Report files changed.',
+      'Run pytest -q after fixing. Report files changed.',
       { label: 'proto:fix', phase: 'Protocol Audit', agentType: 'python-implementer' }
     )
+
+    // GH-20: gate after protocol fix — domain regressions must be caught before recheck
+    const protoFixGate = await agent(
+      'Run: python -m pytest -q\n' +
+      'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
+      '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
+      { schema: GATE_SCHEMA, label: 'gate:proto:fix', phase: 'Protocol Audit' }
+    )
+    if (protoFixGate && protoFixGate.exitCode !== 0) {
+      testsRed = true
+      log('Gate RED after proto:fix (' + protoFixGate.failCount + ' failing) — dispatching test-fix agent')
+      await agent(
+        'Fix the failing tests introduced by the protocol fix. Read the test file and source.\n' +
+        'Failing tests:\n' + protoFixGate.failures.join('\n') + '\n\n' +
+        'Run `python -m pytest -q <failing-test-file>` to confirm GREEN before finishing.',
+        { label: 'fix:tests:proto:fix', phase: 'Protocol Audit' }
+      )
+    }
 
     // Recheck: same parallel advisor dispatch as the initial audit (including seam)
     const recheckTasks = []
@@ -681,9 +759,10 @@ if (!runProtocol) {
     if (runMCP) {
       recheckTasks.push(function() {
         return agent(
-          'MCP server re-audit after preceding fix. Check same surfaces.\n' +
+          'MCP re-audit after preceding fix. Check same surfaces.\n' +
           'Creates paths:\n' + wave.allCreates.join('\n') + '\n' +
-          'Focus on previously-critical findings. Return structured findings.',
+          'Focus on previously-critical findings (Streamable-HTTP, OAuth 2.1, PKCE, initialize echo, tools/list). ' +
+          'Return structured findings.',
           { schema: PROTO_SCHEMA, agentType: 'mcp-advisor', label: 'proto:recheck:mcp', phase: 'Protocol Audit' }
         )
       })
@@ -749,6 +828,56 @@ for (const f of allHighFindings) {
 
 log('Codifying ' + toCodeify.length + ' critical/high finding(s)')
 
+// ─── SDK issue scan (end of Codify) ──────────────────────────────────────────
+// Classify critical/high findings as SDK-level vs agent-domain.
+// SDK-level ones are written to workspace/sdk-candidates.md for /sdk-issue-scan.
+if (toCodeify.length > 0) {
+  const sdkScan = await agent(
+    'Classify each finding as SDK-level or agent-domain.\n\n' +
+    'SDK-LEVEL (include in output):\n' +
+    '- Harness: wrong step in a SKILL.md, wrong agent instruction, wave-cycle.js logic error\n' +
+    '- SDK internals: build_app(), Agent, ToolSet, SourceAdapter base class, credential store, loop\n' +
+    '- Protocol surface: wrong HTTP status, missing handler, wrong shape in src/routes/\n' +
+    '- Template scaffold: wrong pattern shown in template/, wrong SDK API in an example\n' +
+    '- Security: an SI violation that the SDK itself causes (not domain code)\n\n' +
+    'AGENT-DOMAIN (exclude):\n' +
+    '- src/tools/, src/sources/, src/config.py, src/persona.py\n' +
+    '- Agent-specific credential setup, domain test failures\n' +
+    '- An SI violation in the agent\'s domain code (fix the code, not the SDK)\n\n' +
+    'For each SDK-level finding, assign a component:\n' +
+    'harness/skill | harness/workflow | harness/agent | harness/template |\n' +
+    'sdk/build | sdk/loop | sdk/credentials | sdk/console |\n' +
+    'protocol/a2a | protocol/mcp | protocol/ag-ui | protocol/a2ui | protocol/oauth | security\n\n' +
+    'Findings to classify:\n' + JSON.stringify(toCodeify, null, 2),
+    { schema: SDK_SCAN_SCHEMA, label: 'sdk:scan', phase: 'Codify' }
+  )
+
+  if (sdkScan && sdkScan.sdkCandidates.length > 0) {
+    sdkCandidatesCount = sdkScan.sdkCandidates.length
+    const candidateLines = sdkScan.sdkCandidates.map(function(c, i) {
+      return '## Candidate ' + (i + 1) + ': ' + c.description + '\n' +
+             '- Severity: ' + c.severity + '\n' +
+             '- Component: ' + c.component + '\n' +
+             '- File: ' + (c.file || 'n/a') + '\n' +
+             '- Rationale: ' + c.rationale
+    }).join('\n\n')
+
+    await agent(
+      'Write the file workspace/sdk-candidates.md with exactly this content:\n\n' +
+      '# SDK issue candidates — ' + wave.waveId + ' (' + TODAY + ')\n\n' +
+      'These critical/high findings from wave ' + wave.waveId + ' are classified as\n' +
+      'SDK-level. Run `/sdk-issue-scan` to review and file them as GitHub issues\n' +
+      'on `wailuen/a2a-sdk`. One confirmation per filing — nothing is filed automatically.\n\n' +
+      candidateLines,
+      { label: 'sdk:candidates', phase: 'Codify' }
+    )
+    log('SDK issue candidates: ' + sdkScan.sdkCandidates.length + ' finding(s) written to workspace/sdk-candidates.md')
+    log('Run /sdk-issue-scan to file them as GitHub issues on wailuen/a2a-sdk')
+  } else {
+    log('SDK issue scan: no SDK-level findings in this wave')
+  }
+}
+
 if (toCodeify.length > 0) {
   await parallel(toCodeify.map(function(f, i) {
     return function() {
@@ -810,57 +939,22 @@ if (registryCandidates.length > 0) {
   )
 }
 
-// ─── SDK issue scan (end of Codify) ──────────────────────────────────────────
-// Classify critical/high findings as SDK-level vs agent-domain.
-// SDK-level ones are written to workspace/sdk-candidates.md for /sdk-issue-scan.
-if (toCodeify.length > 0) {
-  const sdkScan = await agent(
-    'Classify each finding as SDK-level or agent-domain.\n\n' +
-    'SDK-LEVEL (include in output):\n' +
-    '- Harness: wrong step in a SKILL.md, wrong agent instruction, wave-cycle.js logic error\n' +
-    '- SDK internals: build_app(), Agent, ToolSet, SourceAdapter base class, credential store, loop\n' +
-    '- Protocol surface: wrong HTTP status, missing handler, wrong shape in src/routes/\n' +
-    '- Template scaffold: wrong pattern shown in template/, wrong SDK API in an example\n' +
-    '- Security: an SI violation that the SDK itself causes (not domain code)\n\n' +
-    'AGENT-DOMAIN (exclude):\n' +
-    '- src/tools/, src/sources/, src/config.py, src/persona.py\n' +
-    '- Agent-specific credential setup, domain test failures\n' +
-    '- An SI violation in the agent\'s domain code (fix the code, not the SDK)\n\n' +
-    'For each SDK-level finding, assign a component:\n' +
-    'harness/skill | harness/workflow | harness/agent | harness/template |\n' +
-    'sdk/build | sdk/loop | sdk/credentials | sdk/console |\n' +
-    'protocol/a2a | protocol/mcp | protocol/ag-ui | protocol/a2ui | protocol/oauth | security\n\n' +
-    'Findings to classify:\n' + JSON.stringify(toCodeify, null, 2),
-    { schema: SDK_SCAN_SCHEMA, label: 'sdk:scan', phase: 'Codify' }
-  )
-
-  if (sdkScan && sdkScan.sdkCandidates.length > 0) {
-    const candidateLines = sdkScan.sdkCandidates.map(function(c, i) {
-      return '## Candidate ' + (i + 1) + ': ' + c.description + '\n' +
-             '- Severity: ' + c.severity + '\n' +
-             '- Component: ' + c.component + '\n' +
-             '- File: ' + (c.file || 'n/a') + '\n' +
-             '- Rationale: ' + c.rationale
-    }).join('\n\n')
-
-    await agent(
-      'Write the file workspace/sdk-candidates.md with exactly this content:\n\n' +
-      '# SDK issue candidates — ' + wave.waveId + ' (' + TODAY + ')\n\n' +
-      'These critical/high findings from wave ' + wave.waveId + ' are classified as\n' +
-      'SDK-level. Run `/sdk-issue-scan` to review and file them as GitHub issues\n' +
-      'on `wailuen/a2a-sdk`. One confirmation per filing — nothing is filed automatically.\n\n' +
-      candidateLines,
-      { label: 'sdk:candidates', phase: 'Codify' }
-    )
-    log('SDK issue candidates: ' + sdkScan.sdkCandidates.length + ' finding(s) written to workspace/sdk-candidates.md')
-    log('Run /sdk-issue-scan to file them as GitHub issues on wailuen/a2a-sdk')
-  } else {
-    log('SDK issue scan: no SDK-level findings in this wave')
-  }
-}
-
 // ─── phase 7: archive ─────────────────────────────────────────────────────────
 phase('Archive')
+
+// GH-22: pre-archive gate — suite must be green before marking wave complete
+const preArchiveGate = await agent(
+  'Run: python -m pytest -q\n' +
+  'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
+  '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
+  { schema: GATE_SCHEMA, label: 'gate:pre-archive', phase: 'Archive' }
+)
+if (preArchiveGate && preArchiveGate.exitCode !== 0) {
+  testsRed = true
+  protocolBlocked = true  // reuse block-archive flag
+  log('Suite is RED (' + preArchiveGate.failCount + ' failing) — archive BLOCKED.')
+  log('Fix the failing tests and re-run /wave ' + wave.waveId)
+}
 
 if (protocolBlocked) {
   log('Archive SKIPPED — wave ' + wave.waveId + ' blocked by critical protocol findings')
@@ -888,8 +982,10 @@ return {
   totalTodos:         totalTodos,
   lrnsCaptured:       toCodeify.length,
   cNnnRegistered:     registryCandidates.length,
+  sdkCandidates:      sdkCandidatesCount,
   groupsExecuted:     wave.groups.length,
   phaseRedteamRounds: pRound,
   exhausted:          pRound >= 8,
   protocolBlocked:    protocolBlocked,
+  testsRed:           testsRed,
 }
