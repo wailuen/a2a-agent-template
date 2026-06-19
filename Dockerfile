@@ -2,7 +2,11 @@
 # Build:  docker build --ssh default -t {{AGENT_NAME}} .
 # The SSH key is mounted only for the install step and never enters a layer.
 
+FROM ghcr.io/astral-sh/uv:latest AS uv
+
 FROM python:3.12-slim AS build
+
+COPY --from=uv /uv /usr/local/bin/uv
 
 RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \
     && rm -rf /var/lib/apt/lists/*
@@ -17,27 +21,39 @@ github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+V
 EOF
 
 WORKDIR /app
-COPY pyproject.toml ./
+# PREREQUISITE: uv.lock must exist before running `docker build`.
+# The raw template ships no lockfile — pyproject.toml contains unresolved
+# {{SDK_GIT_URL}}/{{SDK_SHA}} placeholders that `uv lock` cannot resolve.
+# Run `/setup` or `/new-agent` first (scaffold Phase 2 renders placeholders
+# and generates uv.lock). Building from the unscaffolded template repo will
+# fail here with "COPY failed: file not found in build context: uv.lock".
+COPY pyproject.toml uv.lock ./
 COPY src ./src
 
-# The ssh mount exists only for this RUN; --no-cache-dir keeps wheels and
-# any URL metadata out of the layer.
+# --frozen pins to the committed lockfile — no fresh resolution at build time.
+# UV_LINK_MODE=copy avoids hardlink failures when the venv is copied across
+# overlay filesystem boundaries in the multi-stage build.
+# The ssh mount is never committed to a layer; it exists only for this RUN.
+# Dev deps live under [project.optional-dependencies].dev (an *extra*, not a
+# dependency-group), so they are excluded by default — no --extra flag needed.
+# Do not add --no-dev here: that flag targets [dependency-groups], not extras,
+# and would be a silent no-op against this layout.
+ENV UV_LINK_MODE=copy
 RUN --mount=type=ssh \
-    pip install --no-cache-dir --prefix=/install . \
-    && pip install --no-cache-dir --prefix=/install "uvicorn[standard]"
+    uv sync --frozen
 
 
 FROM python:3.12-slim
 
 RUN useradd --create-home --uid 10001 agent \
     && mkdir -p /data && chown agent:agent /data
-COPY --from=build /install /usr/local
+COPY --from=build /app/.venv /app/.venv
 COPY --chown=agent:agent src /app/src
 
 USER agent
 WORKDIR /app
 VOLUME ["/data"]
-ENV DATA_DIR=/data PORT=8000
+ENV DATA_DIR=/data PORT=8000 PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
