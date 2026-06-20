@@ -285,6 +285,13 @@ const rawResults = await pipeline(
   }
 )
 
+// Failure reification must honor the same per-transport N/A scoring rule the
+// live path uses (FINAL SCORING / IMPORTANT RULES: an un-run transport scores
+// 10, not 1).  A crashed agent only fails the transports that were actually
+// active for this run; transports not in `transports` were never exercised and
+// must not drag the summary aggregate to 1.
+const ranA2A  = transports.indexOf('a2a') !== -1
+const ranAGUI = transports.indexOf('agui') !== -1
 const results = rawResults.map(function(r, i) {
   if (r != null) return r
   const s = scenarios[i]
@@ -292,8 +299,8 @@ const results = rawResults.map(function(r, i) {
     scenarioId:    s.id,
     name:          s.name,
     passed:        false,
-    a2aMinScore:   1,
-    aguiMinScore:  1,
+    a2aMinScore:   ranA2A ? 1 : 10,
+    aguiMinScore:  ranAGUI ? 1 : 10,
     a2aTurns:      [],
     aguiTurns:     [],
     failureClass:  'code-bug',

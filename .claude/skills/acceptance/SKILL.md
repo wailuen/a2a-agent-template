@@ -232,8 +232,10 @@ and an incremented `runId`.
 ### Workflow invocation
 
 ```
+// Using scriptPath instead of name: Workflow({name}) drops args in Claude Code's
+// named-workflow resolver; remove once upstream bug is fixed.
 Workflow({
-  name: 'acceptance-api',
+  scriptPath: `${require('child_process').execSync('git rev-parse --show-toplevel').toString().trim()}/.claude/workflows/acceptance-api.js`,
   args: {
     scenarios: <parsed scenarios array>,
     baseUrl: <base_url>,
