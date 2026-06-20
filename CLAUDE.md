@@ -121,13 +121,29 @@ Full grep checks in `.claude/reference/sdk-security-invariants.md`.
 | Upstream/vendor key | Encrypted credential store (AES-256-GCM, keyed by MASTER_KEY) | `self.credential("field_name")` inside a `SourceAdapter` | Upstream APIs (CRM, financial data, Graph, etc.) |
 | LLM API key | Encrypted credential store (`__model__` namespace) | SDK reads it at boot from `/admin → Model Backend`; never in `.env` | LLM backend |
 | Model backend config | `.env` — non-secret operational vars only (`BEDROCK_MODEL_ARN`, `OPENAI_MODEL`, `AZURE_OPENAI_ENDPOINT`, etc.) | `Settings` fields; no secrets here | routing only |
-| Azure Storage connection string | `.env` — infrastructure config (treat as secret; use managed identity in prod) | `AZURE_STORAGE_CONNECTION_STRING` env var (read by SDK auto-detection) | Azure Table Storage |
+| Azure Storage connection string | `.env` — local dev: `UseDevelopmentStorage=true` (Azurite); prod: managed identity (`AZURE_STORAGE_ACCOUNT_NAME`) | `AZURE_STORAGE_CONNECTION_STRING` env var (read by SDK auto-detection) | Azure Table Storage |
 | `MASTER_KEY` | `.env` — **same value in dev AND prod** | SDK reads at boot; never in source | decrypts credential store |
 
 > **Azure Table Storage is the PRIMARY credential store.** SQLite (`/data/credentials.db`) is a
 > dev fallback only. The SDK logs a WARNING at boot if it falls back to SQLite outside DEV_MODE —
 > that warning means `AZURE_STORAGE_CONNECTION_STRING` is missing from `.env`. Fix it before
 > deploying.
+
+> **Local dev with Azure backends:** If the agent uses `AZURE_STORAGE_ACCOUNT_NAME` (managed
+> identity), running locally requires `az login` — which is unacceptable in dev. Use Azurite
+> (the Azure Storage emulator) instead:
+> ```bash
+> # Install once
+> npm install -g azurite   # or: brew install azurite
+> # Start in background (local port 10000/10001/10002)
+> azurite --silent --location /tmp/azurite &
+> # Add to .env (takes priority over AZURE_STORAGE_ACCOUNT_NAME)
+> echo "AZURE_STORAGE_CONNECTION_STRING=UseDevelopmentStorage=true" >> .env
+> ```
+> The SDK checks `AZURE_STORAGE_CONNECTION_STRING` before `AZURE_STORAGE_ACCOUNT_NAME`, so the
+> Azurite connection string takes priority. Production deployment is unaffected — ACA uses the
+> managed identity path (`AZURE_STORAGE_ACCOUNT_NAME`) where `AZURE_STORAGE_CONNECTION_STRING`
+> is absent.
 
 > **`MASTER_KEY` must be identical across all environments.** Generate it once during `/provision`
 > and copy the same value to every environment's `.env` (dev, staging, prod). A different key in
@@ -158,8 +174,14 @@ If an agent was bootstrapped without Azure configured (SQLite fallback), migrate
 # 1. Confirm the boot warning is present (SQLite fallback active)
 DEV_MODE=true uvicorn src.main:app --port 8000 --workers 1  # look for WARNING in logs
 
-# 2. Set Azure + MASTER_KEY in .env (same key that was used for SQLite)
-echo "AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=..." >> .env
+# 2a. LOCAL DEV — use Azurite (no az login required)
+#     npm install -g azurite && azurite --silent --location /tmp/azurite &
+#     echo "AZURE_STORAGE_CONNECTION_STRING=UseDevelopmentStorage=true" >> .env
+
+# 2b. PROD/STAGING — real Azure connection string or managed identity
+#     echo "AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=..." >> .env
+#     # or: echo "AZURE_STORAGE_ACCOUNT_NAME=mystorageaccount" >> .env
+
 echo "MASTER_KEY=<your-existing-key>" >> .env
 
 # 3. Dry-run to see what will move
