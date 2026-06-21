@@ -40,6 +40,17 @@
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json, re\nfrom pathlib import Path\ntry:\n    raw = sys.stdin.read()\n    data = json.loads(raw)\n    cmd = data.get('tool_input', {}).get('command', '')\n    if 'git commit' not in cmd:\n        sys.exit(0)\n    env_path = Path('.env')\n    if not env_path.exists():\n        sys.exit(0)\n    desc = ''\n    for line in env_path.read_text().splitlines():\n        if line.startswith('AGENT_DESCRIPTION='):\n            desc = line.split('=', 1)[1].strip().strip('\\\"').strip(\\\"'\\\")\n            break\n    if desc:\n        sys.exit(0)\n    has_tools = Path('src/tools').exists() and any(p for p in Path('src/tools').glob('*.py') if p.name != '__init__.py')\n    has_skills = Path('src/skills').exists() and any(Path('src/skills').glob('*.md'))\n    if has_tools or has_skills:\n        print('CARD-DESCRIPTION-HOOK: AGENT_DESCRIPTION in .env is blank. A2A registries use this field for agent discovery — without it the agent is invisible to semantic matching. Run /update-card-description to generate one from current tools and skills before committing.')\nexcept Exception:\n    pass\n\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Bash",

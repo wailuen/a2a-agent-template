@@ -48,6 +48,7 @@ No features the PRD doesn't mention. When in doubt, read the code.
 | `/migrate` | Cross-wave refactor planning |
 | `/scenario` | Draft a new JTBD acceptance scenario |
 | `/changelog` | Generate release notes for a version bump |
+| `/update-card-description` | Regenerate `AGENT_DESCRIPTION` in `.env` from current tool docstrings + skill descriptions — run before committing when tools/skills changed |
 | `/sdk-issue` | File a confirmed SDK bug or enhancement as a GitHub issue |
 | `/sdk-issue-scan` | Batch-file SDK-level findings from a wave or redteam; reads `workspace/sdk-candidates.md` |
 
