@@ -65,6 +65,14 @@ No features the PRD doesn't mention. When in doubt, read the code.
 
 - **Test-first for correctness-bearing code.** Write the failing test first
   (RED), then the code (GREEN), then refactor. A todo that skips RED is incomplete.
+- **No mocks.** Never use `unittest.mock.patch`, `MagicMock`, or `AsyncMock` to
+  substitute SDK components (stores, backends, route handlers, adapters). Mocks
+  diverge silently from the real implementation and pass tests that fail in prod.
+  Use `agent_sdk.testing` utilities (`FakeModelClient`, `reply`, `tool_call`) —
+  these are purpose-built stubs that track the real interface. Use the real
+  in-memory stores (`InMemoryTaskStore`, `EncryptedSqliteStore` with a temp path)
+  for persistence tests. For outbound HTTP, use `respx` or a local ASGI test
+  client — never patch `httpx`.
 - **Zero-tolerance redteam gates.** No finding survives a wave. Fix → re-redteam
   → repeat until clean.
 - **Learning-as-code.** Every non-obvious root cause becomes an LRN record in
@@ -112,6 +120,7 @@ Full grep checks in `.claude/reference/sdk-security-invariants.md`.
   `AGENT_SDK_` env prefix is reserved by the SDK.
 - Tests: use `agent_sdk.testing` (`FakeModelClient`, `reply`, `tool_call`)
   against an isolated `Agent` instance. Never call the live model backend in tests.
+  No `unittest.mock` — see the **No mocks** discipline above.
 
 ## Credential model
 
