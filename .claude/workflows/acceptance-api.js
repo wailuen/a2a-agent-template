@@ -10,7 +10,9 @@ export const meta = {
 // args.scenarios   : array of {id, name, category, seedQuery, expectedTools,
 //                    expectedContentTypes, maxTurns, followUpTurns?}
 // args.baseUrl     : e.g. "http://localhost:8000"
-// args.adminKey    : admin API key from workspace/adr/ADR-000-<env>-credentials.md
+// args.keyFile     : path to a temp file containing the admin API key (written by
+//                    the skill caller using require('fs') before invoking this
+//                    workflow; the workflow itself cannot use require() in the sandbox)
 // args.agentContext: {name, description, tools: [{name, emits, description}]}
 // args.onlyIds     : optional string[] — re-run only these scenario IDs
 // args.transports  : optional string[] — ["a2a","agui"] (default: both)
@@ -67,7 +69,7 @@ function buildScenarioPrompt(s, a) {
   const transports     = (a.transports && a.transports.length > 0) ? a.transports : ['a2a', 'agui']
   const runA2A         = transports.indexOf('a2a') !== -1
   const runAGUI        = transports.indexOf('agui') !== -1
-  const runKey         = s.id + '-' + require('crypto').randomUUID()
+  const runKey         = (a.runId ? a.runId + '-' : '') + s.id
 
   return (
     'You are running an acceptance test for the agent "' + a.agentContext.name + '".\n\n' +
@@ -92,8 +94,8 @@ function buildScenarioPrompt(s, a) {
       : '') +
 
     '━━━ SERVER ━━━\n' +
-    'Base URL:   ' + a.baseUrl + '\n' +
-    'Admin key:  ' + a.adminKey + '\n\n' +
+    'Base URL:    ' + a.baseUrl + '\n' +
+    'Admin key:   read from ' + a._keyFile + ' (do NOT log or echo the value)\n\n' +
 
     '━━━ INSTRUCTIONS ━━━\n\n' +
     'Run this scenario on ' + (runA2A && runAGUI ? 'BOTH transports in sequence' : transports[0].toUpperCase() + ' transport only') + '.\n' +
@@ -112,19 +114,32 @@ function buildScenarioPrompt(s, a) {
     '   import asyncio, httpx, json, os\n' +
     '   from pathlib import Path\n\n' +
     '   BASE_URL = "' + a.baseUrl + '"\n' +
-    '   TOKEN    = "' + a.adminKey + '"\n' +
+    '   TOKEN    = Path("' + a._keyFile + '").read_text().strip()\n' +
     '   RUN_KEY  = "' + runKey + '"\n' +
     '   QUERY    = os.environ["ACC_QUERY"]\n' +
-    '   TASKID_F = Path(f"/tmp/acc-{RUN_KEY}-a2a-task.txt")\n\n' +
+    '   TASKID_F = Path(f"/tmp/acc-{RUN_KEY}-a2a-task.txt")\n' +
+    '   CTXID_F  = Path(f"/tmp/acc-{RUN_KEY}-a2a-ctx.txt")\n' +
+    '   STATE_F  = Path(f"/tmp/acc-{RUN_KEY}-a2a-state.txt")\n\n' +
     '   async def main():\n' +
     '       headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}\n' +
-    '       task_id = TASKID_F.read_text().strip() if TASKID_F.exists() else None\n' +
+    '       task_id    = TASKID_F.read_text().strip() if TASKID_F.exists() else None\n' +
+    '       context_id = CTXID_F.read_text().strip()  if CTXID_F.exists()  else None\n' +
+    '       last_state = STATE_F.read_text().strip()   if STATE_F.exists()  else None\n' +
     '       import uuid as _uuid\n' +
     '       msg = {"role": "user", "messageId": _uuid.uuid4().hex, "parts": [{"kind": "text", "text": QUERY}]}\n' +
-    '       if task_id:\n' +
+    '       # Turn 2+: reuse taskId only when the prior task is still input-required or\n' +
+    '       # auth-required (both are non-terminal interrupt states per A2A spec §interrupt);\n' +
+    '       # for completed/failed tasks send contextId so the server starts a new task\n' +
+    '       # in the same conversation context instead of re-addressing a terminal task.\n' +
+    '       if task_id and last_state in ("input-required", "auth-required"):\n' +
     '           msg["taskId"] = task_id\n' +
+    '       elif context_id:\n' +
+    '           msg["contextId"] = context_id\n' +
     '       body = {"message": msg}\n' +
     '       reply_parts, ctypes = [], []\n' +
+    '       cur_task_id = None\n' +
+    '       cur_ctx_id  = None\n' +
+    '       cur_state   = None\n' +
     '       async with httpx.AsyncClient(base_url=BASE_URL, headers=headers, timeout=180) as c:\n' +
     '           async with c.stream("POST", "/v1/message:stream", json=body) as r:\n' +
     '               r.raise_for_status()\n' +
@@ -132,10 +147,14 @@ function buildScenarioPrompt(s, a) {
     '                   if not line.startswith("data:"): continue\n' +
     '                   ev = json.loads(line[5:].strip())\n' +
     '                   if ev.get("kind") == "task":\n' +
-    '                       if not task_id: task_id = ev.get("id","")\n' +
+    '                       if not cur_task_id: cur_task_id = ev.get("id", "")\n' +
+    '                       if not cur_ctx_id:  cur_ctx_id  = ev.get("contextId", "")\n' +
     '                   elif ev.get("kind") == "status-update":\n' +
-    '                       if not task_id: task_id = ev.get("taskId","")\n' +
-    '                       if ev.get("final") or (ev.get("status",{}).get("state") == "completed"):\n' +
+    '                       if not cur_task_id: cur_task_id = ev.get("taskId", "")\n' +
+    '                       if not cur_ctx_id:  cur_ctx_id  = ev.get("contextId", "")\n' +
+    '                       st = ev.get("status", {}).get("state") or ""\n' +
+    '                       if st: cur_state = st\n' +
+    '                       if ev.get("final") or st == "completed":\n' +
     '                           reply_parts = [p["text"] for p in (ev.get("status",{}).get("message") or {}).get("parts",[]) if p.get("kind") == "text"]\n' +
     '                   elif ev.get("kind") == "artifact-update":\n' +
     '                       art = ev.get("artifact") or {}\n' +
@@ -147,7 +166,9 @@ function buildScenarioPrompt(s, a) {
     '                               meta = part.get("metadata") or {}\n' +
     '                               ctype = art_dtype or meta.get("data_type") or meta.get("mimeType")\n' +
     '                               if ctype and ctype not in ctypes: ctypes.append(ctype)\n' +
-    '       if task_id: TASKID_F.write_text(task_id)\n' +
+    '       if cur_task_id: TASKID_F.write_text(cur_task_id)\n' +
+    '       if cur_ctx_id:  CTXID_F.write_text(cur_ctx_id)\n' +
+    '       if cur_state:   STATE_F.write_text(cur_state)\n' +
     '       print(json.dumps({"reply": "\\n".join(reply_parts), "contentTypes": ctypes}))\n\n' +
     '   asyncio.run(main())\n' +
     '   ─────────────────────────────────────────────\n\n' +
@@ -174,7 +195,7 @@ function buildScenarioPrompt(s, a) {
     '   from the prior A2A reply (not generic).\n\n' +
 
     'After all A2A turns: compute a2aMinScore = min of all turn scores.\n' +
-    'Clean up /tmp/acc-' + runKey + '-a2a-* files.\n\n'
+    'Clean up /tmp/acc-' + runKey + '-a2a-* files (task, ctx, and state files).\n\n'
     ) : '') +
 
     // ── AG-UI transport ────────────────────────────────────────────────────────
@@ -192,7 +213,7 @@ function buildScenarioPrompt(s, a) {
     '   from pathlib import Path\n' +
     '   from agent_sdk.testing import ChatDriver\n\n' +
     '   BASE_URL  = "' + a.baseUrl + '"\n' +
-    '   TOKEN     = "' + a.adminKey + '"\n' +
+    '   TOKEN     = Path("' + a._keyFile + '").read_text().strip()\n' +
     '   THREAD_ID = "' + runKey + '-agui"\n' +
     '   MSGS_FILE = Path("/tmp/acc-' + runKey + '-agui-msgs.json")\n' +
     '   QUERY     = os.environ["ACC_QUERY"]\n\n' +
@@ -273,7 +294,22 @@ const scenarios = (args.onlyIds && args.onlyIds.length > 0)
 
 log('Running ' + scenarios.length + ' scenario(s) in parallel  |  transports: ' + transports.join(' + ') + '  |  ' + args.baseUrl)
 
-const enrichedArgs = Object.assign({}, args, { transports: transports })
+// ── Secret externalisation ────────────────────────────────────────────────────
+// The admin key is NOT passed as args.adminKey.  Instead the skill caller (which
+// runs outside the workflow sandbox and has access to require('fs') / require('crypto'))
+// writes the key to a per-run chmod-600 temp file and passes only the file path
+// as args.keyFile.  Sub-agents read the key from disk; it never appears in the
+// workflow args object or in harness transcripts.
+//
+// SI-2 spirit: the key must not appear in logs or agent transcripts.  The temp-
+// file indirection is the closest available mechanism given the harness sandbox
+// has no CommonJS require() and therefore no direct fs/crypto access.
+//
+// Cleanup: the caller is responsible for unlinking args.keyFile after the
+// Workflow() call returns (temp files are also reclaimed by OS on reboot).
+const _keyFile = args.keyFile
+
+const enrichedArgs = Object.assign({}, args, { transports: transports, _keyFile: _keyFile })
 
 const rawResults = await pipeline(
   scenarios,
