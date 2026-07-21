@@ -60,6 +60,16 @@ const AUTH_SURFACE = ['src/routes/oauth', 'src/auth/middleware', 'src/auth/oauth
 const A2A_SURFACE  = ['src/routes/a2a', 'src/routes/agent_card', 'src/models/a2a'].concat(AUTH_SURFACE)
 const MCP_SURFACE  = ['src/routes/mcp'].concat(AUTH_SURFACE)
 const AGUI_SURFACE = ['src/routes/ag_ui'].concat(AUTH_SURFACE)
+// RT-003 (low, this wave): A2UI_SURFACE deliberately does NOT fold in AUTH_SURFACE, unlike
+// A2A_SURFACE/MCP_SURFACE/AGUI_SURFACE above. A2UI has no transport of its own — it is
+// delivered exclusively as an A2A DataPart or an AG-UI CUSTOM event, so a wave touching only
+// an AUTH_SURFACE file already sets runA2A/runAGUI (both fold in AUTH_SURFACE), dispatching
+// a2a-advisor/ag-ui-advisor plus the unconditional seam leg below — the layer where A2UI's
+// transport-level auth is actually enforced and audited. Folding AUTH_SURFACE in here too
+// would dispatch a2ui-advisor on every auth-only wave for no added coverage: a2ui-advisor
+// audits component/message-shape conformance, not authentication. Unlike AUTH_SURFACE's fold
+// into the three transport arrays (a genuine under-triggering risk closed by GH-123/LRN-132),
+// omitting it here is not an under-trigger — it is a documented exception, not a silent gap.
 const A2UI_SURFACE = ['src/a2ui/', 'src/models/content_types']
 
 // ─── schemas ──────────────────────────────────────────────────────────────────
