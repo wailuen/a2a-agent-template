@@ -1027,14 +1027,25 @@ if (!runProtocol) {
   // surface accepts a token type another rejects", the check most relevant to that class
   // of change. seamPaths is still computed to narrow the "files to audit" hint in the
   // prompt, but no longer gates whether the task runs — wave.allScope is always given too.
-  const SEAM_ROUTE_MARKERS = ['routes/', '/a2a', '/mcp', '/oauth', '/agent_card', '/ag_ui', '/a2ui']
+  // RT-001 (round-4 fresh-lens): '/oauth' was DROPPED from the marker list. Substring
+  // matching with a leading slash still matches a PREFIX of a longer segment, so '/oauth'
+  // matched the credential-verification store src/auth/oauth_tokens (an AUTH_SURFACE member,
+  // NOT a route file) at the '.../auth/oauth_tokens' boundary — listing it under the seam
+  // hint's heading while its sibling auth members (middleware, api_keys, identity) fell
+  // through to the placeholder, an asymmetric mislabel this wave exposed by promoting auth
+  // files into the protocol-surface arrays. '/oauth' was redundant anyway: the genuine OAuth
+  // route file src/routes/oauth is already caught by the 'routes/' marker, so dropping it
+  // loses zero coverage and removes the mislabel. The heading below is also neutralized to
+  // "Candidate route/shared surfaces" so any OTHER matched shared surface (e.g. src/a2ui/ via
+  // '/a2ui', which has no HTTP route of its own) is likewise not described as a route file.
+  const SEAM_ROUTE_MARKERS = ['routes/', '/a2a', '/mcp', '/agent_card', '/ag_ui', '/a2ui']
   const seamPaths = wave.allScope.filter(function(p) {
     return SEAM_ROUTE_MARKERS.some(function(m) { return p.indexOf(m) !== -1 })
   })
   advisorTasks.push(function() {
     return agent(
       'Cross-protocol seam audit — consistency ACROSS A2A, MCP, AG-UI, A2UI surfaces.\n\n' +
-      'Route files to audit (derived from wave scope):\n' +
+      'Candidate route/shared surfaces in scope (derived from wave scope):\n' +
       (seamPaths.length > 0 ? seamPaths.join('\n') : '(none matched by name — shared/auth surface change; see full scope below)') + '\n\n' +
       'Wave scope paths (Creates: ∪ Modifies:):\n' + wave.allScope.join('\n') + '\n\n' +
       'Check:\n' +
@@ -1189,7 +1200,7 @@ if (!runProtocol) {
     recheckTasks.push(function() {
       return agent(
         'Cross-protocol seam re-audit after preceding fix.\n' +
-        'Route files to audit:\n' +
+        'Candidate route/shared surfaces in scope:\n' +
         (seamPaths.length > 0 ? seamPaths.join('\n') : '(none matched by name — shared/auth surface change; see full scope below)') + '\n' +
         'Scope paths (Creates: ∪ Modifies:):\n' + wave.allScope.join('\n') + '\n' +
         'Focus on previously-critical SEAM findings. Return structured findings.',
