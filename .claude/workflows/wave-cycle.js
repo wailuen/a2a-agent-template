@@ -1015,9 +1015,6 @@ if (!runProtocol) {
   // so no single advisor owns it. Uses the default agent with full cross-surface context.
   // RT-005: derive seam paths from allScope (Creates: ∪ Modifies:) rather than hardcoding —
   // hardcoded paths silently produce empty results when routes live at different paths or are not yet created.
-  // WC-007: leading-slash anchors each marker to a path-segment boundary, preventing
-  // false positives from names like 'mcptools.py' or 'pseudoa2a.py' matching 'mcp'/'a2a'.
-  // 'routes/' is kept as-is — the trailing slash already anchors it to a directory name.
   // RT-001: dispatched unconditionally whenever this block runs at all — it only runs
   // inside the `if (runProtocol)` branch above — matching sdk-wave.js, which never gates
   // its seam task on a marker list. Previously this leg was ALSO gated on
@@ -1025,22 +1022,24 @@ if (!runProtocol) {
   // array but not matched by SEAM_ROUTE_MARKERS (e.g. AUTH_SURFACE's src/auth/middleware)
   // skipped the seam audit — the one leg that checks "Auth mode enforced uniformly: no
   // surface accepts a token type another rejects", the check most relevant to that class
-  // of change. seamPaths is still computed to narrow the "files to audit" hint in the
-  // prompt, but no longer gates whether the task runs — wave.allScope is always given too.
-  // RT-001 (round-4 fresh-lens): '/oauth' was DROPPED from the marker list. Substring
-  // matching with a leading slash still matches a PREFIX of a longer segment, so '/oauth'
-  // matched the credential-verification store src/auth/oauth_tokens (an AUTH_SURFACE member,
-  // NOT a route file) at the '.../auth/oauth_tokens' boundary — listing it under the seam
-  // hint's heading while its sibling auth members (middleware, api_keys, identity) fell
-  // through to the placeholder, an asymmetric mislabel this wave exposed by promoting auth
-  // files into the protocol-surface arrays. '/oauth' was redundant anyway: the genuine OAuth
-  // route file src/routes/oauth is already caught by the 'routes/' marker, so dropping it
-  // loses zero coverage and removes the mislabel. The heading below is also neutralized to
-  // "Candidate route/shared surfaces" so any OTHER matched shared surface (e.g. src/a2ui/ via
-  // '/a2ui', which has no HTTP route of its own) is likewise not described as a route file.
-  const SEAM_ROUTE_MARKERS = ['routes/', '/a2a', '/mcp', '/agent_card', '/ag_ui', '/a2ui']
+  // of change. seamPaths is still only a HINT that narrows the "files to audit" line in the
+  // prompt; it no longer gates whether the task runs — wave.allScope is always given in full.
+  // RT-001 (round-7 fresh-lens): markers are matched as WHOLE path segments — a file
+  // basename minus its extension, or a directory name — NOT as substrings. This delivers
+  // the segment-boundary match the earlier leading-slash markers ('/mcp', '/a2a', …) only
+  // half-provided: a leading slash anchors a segment's START but not its END, so '/mcp'
+  // still prefix-matched '/mcptools' and '/a2a' matched 'pseudoa2a'. Whole-segment matching
+  // makes both non-matches — 'mcptools'/'pseudoa2a' are not the segments 'mcp'/'a2a' — and
+  // needs no 'auth'-fragment marker: the OAuth route routes/oauth is caught by the 'routes'
+  // segment, while the credential store auth/oauth_tokens (a non-route AUTH_SURFACE member)
+  // is correctly excluded, ending the round-4 asymmetric mislabel at its source. The heading
+  // below stays "Candidate route/shared surfaces" so a matched non-HTTP shared surface
+  // (e.g. src/a2ui/… via the 'a2ui' segment) is not described as a route file.
+  const SEAM_ROUTE_MARKERS = ['routes', 'a2a', 'mcp', 'agent_card', 'ag_ui', 'a2ui']
   const seamPaths = wave.allScope.filter(function(p) {
-    return SEAM_ROUTE_MARKERS.some(function(m) { return p.indexOf(m) !== -1 })
+    return p.split('/').some(function(seg) {
+      return SEAM_ROUTE_MARKERS.indexOf(seg.replace(/\.[^./]+$/, '')) !== -1
+    })
   })
   advisorTasks.push(function() {
     return agent(
