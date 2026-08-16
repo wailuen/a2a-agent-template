@@ -61,6 +61,20 @@ Collect, then echo back a summary for confirmation before touching any file:
    console) and/or the built-in OAuth 2.1 chain for MCP. Note: a Claude.ai MCP
    connector uses DCR-based OAuth automatically — static bearer tokens are not
    supported on that surface.
+   - **If OAuth is selected**, also ask: "One-time consent scope — per-user or
+     per-org?"
+     - **per-user** (default, no extra step): a RETURNING client's own
+       registration skips repeat admin approval, but each new user's own
+       registration still hits the gate once, the first time.
+     - **per-org**: every org member shares ONE pre-approved registration
+       instead of each hitting the gate individually. This needs a SEPARATE
+       Day-2 step against the real deployed `PUBLIC_URL` (not local dev) —
+       flag it now so it isn't forgotten: `python -m agent_sdk
+       provision-org-oauth-client` (see Handoff → Day-2 operations).
+     Either scope sets `AGENT_SDK_OAUTH_ONE_TIME_CONSENT=true` in `.env`
+     (Phase 3); leave OAuth's one-time consent unset (`false`) only if the
+     operator wants every authorization, including repeat ones, to hit the
+     admin gate.
 5. **Model backend** — Bedrock (default) or another `ModelClient`. Collect the
    routing env vars for the chosen backend (these go in `.env`; API keys never go
    in `.env` — they are seeded via the credential store after bootstrapping):
@@ -79,6 +93,10 @@ Collect, then echo back a summary for confirmation before touching any file:
      with `api_version=None`. The API key (`azure_openai_api_key`) is seeded into
      the `__model__` namespace via
      `PUT /admin/api/credentials/__model__/azure_openai_api_key` — never in `.env`.
+   - **OpenAI/Azure OpenAI, optional**: `AGENT_SDK_OPENAI_MAX_RETRIES` (`int`)
+     and `AGENT_SDK_OPENAI_TIMEOUT` (`float`, seconds) in `.env`, forwarded
+     verbatim to the underlying `AsyncOpenAI`/`AsyncAzureOpenAI` constructor.
+     Leave unset to keep the openai SDK's own defaults (`max_retries=2`).
    - **Anthropic**: NOT YET IMPLEMENTED — reserved for a future release. Do not
      configure. (`ANTHROPIC_MODEL` config field and `_build_model_client` code path
      do not exist in the current SDK.)
@@ -133,8 +151,8 @@ remote.
 
 3. **Resolve the target SHA** (capture to a variable — do not echo raw output):
    - If `--sdk-ref` is a 40-char hex SHA: use it verbatim. Warn: "SHA `<sha7>`
-     provided — cannot validate remotely without a full fetch; `pip install` will
-     fail if this SHA does not exist in the SDK repo."
+     provided — cannot validate remotely without a full fetch; `uv sync` will fail
+     to resolve the VCS dependency if this SHA does not exist in the SDK repo."
    - If `--sdk-ref` is a tag (e.g. `v1.3.0`): resolve with
      `git ls-remote ssh://git@github.com/<path> refs/tags/v1.3.0` (or
      `git ls-remote https://github.com/<path> refs/tags/v1.3.0` for HTTPS).
@@ -218,7 +236,19 @@ SHA, wrong format). Stop: "ERROR: malformed or missing pip VCS URL in
 __pycache__
 .pytest_cache
 *.pyc
+workspace/adr/ADR-000-*-credentials.md
+workspace/adr/ADR-001-*-credentials.md
 ```
+After writing, run `git check-ignore -v workspace/adr/ADR-001-dev-credentials.md` from the repo root and confirm it returns a match before proceeding.
+
+**Generate `uv.lock`:**
+```bash
+uv lock
+```
+This must run immediately after placeholder substitution, while `pyproject.toml`
+is fresh with the real SDK SHA. Running it now means Phase 5's `uv sync --frozen`
+will never fail with "no lockfile found". Stage it with the initial commit:
+`git add uv.lock` (alongside the rest of the scaffold).
 
 ## Phase 3 — Generate MASTER_KEY
 
@@ -244,6 +274,12 @@ __pycache__
    - Bedrock: `BEDROCK_REGION=`, `BEDROCK_MODEL_ARN=`
    - OpenAI: `OPENAI_MODEL=`
    - Azure OpenAI: `AZURE_OPENAI_ENDPOINT=`, `AZURE_OPENAI_DEPLOYMENT=`, `AZURE_API_VERSION=`
+   - OpenAI/Azure OpenAI, optional: `AGENT_SDK_OPENAI_MAX_RETRIES=`,
+     `AGENT_SDK_OPENAI_TIMEOUT=` — leave unset for the openai SDK's own defaults.
+   - OAuth one-time consent, if either scope was chosen in Phase 0:
+     `AGENT_SDK_OAUTH_ONE_TIME_CONSENT=true`. Per-org additionally needs the
+     Day-2 `provision-org-oauth-client` step (see Handoff) once a real
+     `PUBLIC_URL` exists — do not run it now, against localhost.
    **Never write any API key or secret into `.env`** — LLM API keys go into the
    `__model__` namespace via the credential store (see step 5 below).
    **If `.env` already exists (re-run):** the script updates only the `MASTER_KEY=`
@@ -292,14 +328,17 @@ Then go directly to the Handoff.
 
 **Otherwise:**
 
-1. Create the venv and install:
+1. Create the venv and install from the lockfile:
    ```bash
-   python3.12 -m venv .venv
-   VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+   uv venv --python 3.12
+   uv sync --frozen --extra dev
    ```
-   If `uv` is not installed: fall back to `.venv/bin/pip install -e ".[dev]"`.
-   If install fails on auth (SDK URL unreachable), point back to Phase 1
-   remediation. Don't paper over it.
+   `--frozen` ensures the install matches the `uv.lock` generated in Phase 2
+   exactly — no silent resolution drift. `--extra dev` installs the `dev`
+   optional-dependency group (pytest, pytest-asyncio, httpx) required by step 2;
+   `uv sync` does not install optional-dependency extras by default. If install
+   fails on auth (SDK URL unreachable), point back to Phase 1 remediation. Don't
+   paper over it.
 
 2. Run the template tests:
    ```bash
@@ -343,10 +382,10 @@ Then go directly to the Handoff.
 1. **Idempotency guard** — grep for `{{` outside `.claude/`; ask before re-running.
 2. **Phase 0 — Interview** — name, domain, sources, auth, model backend + ARN, contrib; confirm before writing.
 3. **Phase 1 — Preflight git access** — confirm SDK URL, verify SSH, resolve SHA + tag via `git ls-remote` (not `git+ls-remote`); stop on failure; offer HTTPS fallback.
-4. **Phase 2 — Substitute placeholders** — all files including manifest; wire sources; grep survivors outside `.claude/`; verify pip VCS URL format.
+4. **Phase 2 — Substitute placeholders** — all files including manifest; wire sources; grep survivors outside `.claude/`; verify pip VCS URL format; run `uv lock`; `git add uv.lock` in the initial commit.
 5. **Phase 3 — Generate MASTER_KEY** — write to `.env` (create or update-in-place); write non-secret routing vars only (never LLM API keys); seed LLM key via `PUT /admin/api/credentials/__model__/<key_field>` after bootstrap; never echoed.
 6. **Phase 4 — Manifest verification** — confirm `.claude/.harness-manifest.json` has no remaining `{{`.
-7. **Phase 5 — First run** (skip with `--no-run`) — install venv; test; port check; boot; bootstrap token → admin key; tear down.
+7. **Phase 5 — First run** (skip with `--no-run`) — `uv sync --frozen`; test; port check; boot; bootstrap token → admin key; tear down.
 8. **Handoff.**
 
 ## Report format
@@ -382,6 +421,12 @@ Manifest:    .claude/.harness-manifest.json ✓
      /provision    — re-seed credentials or walk a new environment
      /upgrade      — bump the SDK pin + sync harness files
      /sdk-issue    — report a bug in the SDK itself (not agent code)
+     python -m agent_sdk provision-org-oauth-client
+                   — per-org OAuth scope only (Phase 0): mint + pre-approve
+                     ONE shared client for org-wide MCP connector access.
+                     Run against the real PUBLIC_URL after deploying, not
+                     local dev — then pin the printed client_id into the
+                     connector platform's static OAuth Client ID field.
 ```
 
 ## Rules
