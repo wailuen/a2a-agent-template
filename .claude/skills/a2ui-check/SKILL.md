@@ -1,12 +1,12 @@
 ---
 name: a2ui-check
-description: "Audit an A2UI implementation for conformance to protocol v0.9.1 AND the A2UI Standard Profile v1 (Core 7 + Extended 11 component types with frozen field contracts). Static code audit + optional live probes across message types (createSurface/updateComponents/updateDataModel/deleteSurface), catalog wiring, Python SDK, A2A DataPart / AG-UI CUSTOM delivery, client renderer (Path A) or backend extraction (Path B), capability negotiation, structural field-contract validation, and the field-hardened conformance traps. Portable and self-contained — audits against the published spec (the a2ui-advisor agent), never against another project's codebase."
+description: "Audit an A2UI implementation for conformance to protocol v0.9.1 AND the A2UI Standard Profile v1.1 (Core 7 + Extended 11 component types with frozen field contracts). Static code audit + optional live probes across message types (createSurface/updateComponents/updateDataModel/deleteSurface), catalog wiring, Python SDK, A2A DataPart / AG-UI CUSTOM delivery, client renderer (Path A) or backend extraction (Path B), capability negotiation, structural field-contract validation, and the field-hardened conformance traps. Portable and self-contained — audits against the published spec (the a2ui-advisor agent), never against another project's codebase."
 ---
 
-# /a2ui-check — A2UI v0.9.1 + Standard Profile v1 conformance audit
+# /a2ui-check — A2UI v0.9.1 + Standard Profile v1.1 conformance audit
 
 Systematic audit of an A2UI implementation against the **A2UI protocol v0.9.1** and the **A2UI
-Standard Profile v1** (`urn:a2ui-profile:standard:v1`). Covers **both server (emit) and client
+Standard Profile v1.1** (`urn:a2ui-profile:standard:v1`). Covers **both server (emit) and client
 (render)**. **Portable / self-contained** — the contract is the published spec in the **`a2ui-advisor`
 agent**; this skill audits an implementation against that spec, never against any other project's
 source or a live endpoint.
@@ -58,7 +58,7 @@ blocks). Note whether `generate_system_prompt()` is called and with what params.
 | `surfaceId` in all post-create messages | Required |
 | `catalogId` in `createSurface` | Required (LLMs drop it); Profile id is `urn:a2ui-profile:standard:v1` |
 | `deleteSurface` before re-creating the same `surfaceId` | Duplicate `createSurface` is a protocol error |
-| `data` field in a DataPart is an array | Even for one message |
+| `DataPart.data` shape is internally consistent with a documented convention | A2UI's own binding requires a bare array; A2A v0.3.0's `DataPart.data` typing requires an object — a genuine, unresolved spec conflict (see A5); an object-wrapped choice MUST be advertised via a `dataEncoding` agent-card hint |
 | Sequential processing on failure | Continue the array on a per-message error; no bail-early |
 
 ### A3 — Component model
@@ -90,7 +90,7 @@ blocks). Note whether `generate_system_prompt()` is called and with what params.
 | MIME type `application/a2ui+json` (canonical v0.9.1) | Not `application/json+a2ui` (legacy/deprecated) |
 | Extension URI in agent card `capabilities.extensions[]` | `https://a2ui.org/a2a-extension/a2ui/v0.9.1` |
 | `X-A2A-Extensions` header on agent-to-agent requests | Required to activate the extension |
-| `DataPart.data` is a JSON array | Not a bare object |
+| `DataPart.data` shape matches a documented convention | A2UI v0.9.1's own binding requires a bare array; A2A v0.3.0's `DataPart.data` typing requires an object — no spec resolves this conflict. Flag only an inconsistent shape across emissions, or an object-wrapped choice missing its `dataEncoding` agent-card hint |
 | `DataPart.metadata.mimeType` set | Required for consumer dispatch |
 
 ### A6 — AG-UI CUSTOM delivery (if applicable)
@@ -108,7 +108,7 @@ blocks). Note whether `generate_system_prompt()` is called and with what params.
 - **v0.8 key-discriminator in v0.9 code** — `{"component":{"Text":{...}}}` vs `{"component":"Text",...}`. Silent failure.
 - **Missing `root`** — client buffers indefinitely; nothing renders.
 - **Unvalidated LLM output** — validate every emission; `"text"` vs `"Text"` is the most common error.
-- **`data` not an array** — protocol error.
+- **`DataPart.data` shape mismatch with the server's own documented convention** — A2UI v0.9.1's own binding requires a bare array; A2A v0.3.0's `DataPart.data` typing requires an object. Neither spec resolves the conflict; flag inconsistency or an undocumented (missing `dataEncoding` hint) object-wrapped choice, not the shape itself.
 - **`catalogId` omitted** from `createSurface` — required; validate before sending.
 - **Wrong MIME type** — `application/json+a2ui` for v0.9.1 is deprecated; flag medium.
 - **Missing `version`** — fails schema validation.
@@ -138,7 +138,7 @@ instead that the backend folds the message sequence, resolves bindings, validate
 payload against the Profile field contract (A9), and emits the project's own content blocks; the
 frontend renders those with no surface model / JSON-Pointer logic of its own.
 
-### A9 — A2UI Standard Profile v1 catalog conformance
+### A9 — A2UI Standard Profile v1.1 catalog conformance
 
 The Profile defines **18 component types** — **Core (7)** every renderer MUST support, **Extended
 (11)** gated by client capability. Full field contracts live in the `a2ui-advisor` agent; this
@@ -197,7 +197,7 @@ curl -X POST "$BASE/v1/message:send" \
   -H "Content-Type: application/json" -H "$AUTH" \
   -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","role":"user","parts":[{"kind":"text","text":"<a query that should yield a chart/table>"}],"messageId":"<uuid>"}}}'
 # Assert: a part with kind=="data" AND metadata.mimeType=="application/a2ui+json"
-# Assert: data[] is an array; first message is createSurface with version, surfaceId, catalogId
+# Assert: data is either a bare array or an object with the array under a wrapper key (check the agent card's dataEncoding hint); first message is createSurface with version, surfaceId, catalogId
 # Assert: an updateComponents has a component id=="root"; component names are PascalCase
 # Assert: any FROZEN Profile payload satisfies its A9 structural contract
 
@@ -239,7 +239,7 @@ A8 Renderer (Path A):    N/A (Path B) | ...
 A9 Profile catalog:      [PASS] FROZEN payloads conform ... [FLAG] RESERVED type emitted with shape ...
 
 Findings: Critical → High → Medium → Low
-Verdict: conformant to protocol v0.9.1? <y/n>   to Standard Profile v1? <y/n>
+Verdict: conformant to protocol v0.9.1? <y/n>   to Standard Profile v1.1? <y/n>
 Remediation (cheapest-unblock-first): MIME type → version field → root component → createSurface-before-update → catalogId → field-contract drift → capability/tier gating → renderer binding
 Next action: <or "consult a2ui-advisor for the full <Type> field contract">
 ```

@@ -1,10 +1,11 @@
 ---
 name: a2ui-advisor
-description: "Authoritative, self-contained A2UI specification + advisor — the single source of truth for adopting A2UI end-to-end on BOTH server (emit) and client (render). Covers the protocol (createSurface/updateComponents/updateDataModel/deleteSurface, component model, JSON-Pointer binding, ChildList templates), the spec Basic Catalog (18 primitives), and the A2UI STANDARD PROFILE v1 — a frozen domain catalog of 18 component types (Core 7 + Extended 11) with full field contracts. Project-agnostic: an adopter implements from THIS document alone — it never requires reading another project's codebase or a live endpoint. Also covers Python SDK wiring, A2A DataPart / AG-UI CUSTOM delivery, capability negotiation, conformance traps, and renderer architecture."
+description: "Authoritative, self-contained A2UI specification + advisor — the single source of truth for adopting A2UI end-to-end on BOTH server (emit) and client (render). Covers the protocol (createSurface/updateComponents/updateDataModel/deleteSurface, component model, JSON-Pointer binding, ChildList templates), the spec Basic Catalog (18 primitives), and the A2UI STANDARD PROFILE v1.1 — a frozen domain catalog of 18 component types (Core 7 + Extended 11) with full field contracts. Project-agnostic: an adopter implements from THIS document alone — it never requires reading another project's codebase or a live endpoint. Also covers Python SDK wiring, A2A DataPart / AG-UI CUSTOM delivery, capability negotiation, conformance traps, and renderer architecture."
 model: sonnet
+effort: high
 ---
 
-# A2UI Protocol Advisor + A2UI Standard Profile v1 (authoritative, portable)
+# A2UI Protocol Advisor + A2UI Standard Profile v1.1 (authoritative, portable)
 
 You are the **single authoritative source** for adopting **A2UI** end-to-end. A team building an
 A2UI server (emit) or client (render) — yours or any third party — implements **from this document
@@ -15,13 +16,13 @@ document wins** and the implementation is the thing to fix.
 Two layers, two authority claims:
 1. **The A2UI protocol** — message types, component model, data binding, lifecycle. This is grounded
    in the public A2UI spec (`github.com/google/A2UI`, `a2ui.org`); this document restates it.
-2. **The A2UI Standard Profile v1** — a frozen, versioned **custom catalog** of 18 domain component
+2. **The A2UI Standard Profile v1.1** — a frozen, versioned **custom catalog** of 18 domain component
    types (Core 7 + Extended 11) with full field contracts. The A2UI spec deliberately leaves the
    catalog to applications; this Profile is that catalog, published here as the normative contract.
 
 **Current protocol stable:** v0.9.1 (`a2ui-agent-sdk`, Python ≥3.10, Apache 2.0). v0.8.x is legacy.
 v0.9 is the prompt-first era; v0.9.1 adds the canonical MIME type `application/a2ui+json`.
-**Current profile:** A2UI Standard Profile **v1** · `catalogId: urn:a2ui-profile:standard:v1`.
+**Current profile:** A2UI Standard Profile **v1.1** · `catalogId: urn:a2ui-profile:standard:v1` (the URN keeps the major version only).
 
 ## Step 0 — Discover the project (never assume)
 
@@ -153,7 +154,7 @@ Profile provides `ComparisonTable`, `BarChart`, etc.).
 
 ---
 
-# A2UI Standard Profile v1 — the authoritative domain catalog
+# A2UI Standard Profile v1.1 — the authoritative domain catalog
 
 `catalogId: urn:a2ui-profile:standard:v1`
 
@@ -218,6 +219,12 @@ Each table: `field · type · required? · notes`. A field with no `?` is **requ
 of `X`. Nested object shapes are given inline or as a sub-table. **Required-key + container-type** is
 what conformance checks (structural only — never value semantics).
 
+- **`metadata` is a cross-cutting field, not a per-type one.** Every FROZEN type may carry an
+  optional free-form `metadata` object (or `null`) as an out-of-band envelope; it has no fixed
+  sub-shape and is therefore not listed in any per-type table. Renderers and Path-B extractors
+  MUST accept and MAY ignore `metadata` on every FROZEN type; conformance audits MUST NOT flag a
+  type for having or lacking it. (Profile v1.1 amendment — see Profile changelog below.)
+
 ## Where a Profile type's fields live on the wire (normative)
 
 Every Profile component carries its payload under a single **`data`** prop, bound to the surface data
@@ -271,7 +278,6 @@ Line/area/bar series over time.
 | `data` | `[TimeSeriesDataPoint]` | ✓ | the series |
 | `total_count` | number | ✓ | number of points |
 | `summary` | `TimeSeriesSummary` | — | |
-| `metadata` | `{identifier?, metric?, frequency?, source?}` | — | |
 
 `TimeSeriesDataPoint`: `date` (string, ✓) · `value` (number\|null, ✓) · `label` (string, —).
 `TimeSeriesSummary` (all —): `min` · `max` · `first` · `last` · `change_percent` · `average` (numbers).
@@ -495,7 +501,7 @@ uses camelCase). All fields optional; emit what you have.
 
 ---
 
-## Profile v1 status summary
+## Profile v1.1 status summary
 
 | Tier | FROZEN | RESERVED |
 |---|---|---|
@@ -506,10 +512,19 @@ uses camelCase). All fields optional; emit what you have.
 (no object contract), rendered as prose not a card. **Totals: 14 FROZEN, 4 RESERVED.**
 
 **Profile versioning.** The Profile is versioned independently of the protocol (`v0.9.1`). Adopters
-pin both: protocol `v0.9.1` + Profile `v1` (`urn:a2ui-profile:standard:v1`). A frozen contract is
+pin both: protocol `v0.9.1` + Profile `v1.1` (`urn:a2ui-profile:standard:v1`). A frozen contract is
 immutable within a major Profile version; a RESERVED type graduating to FROZEN, or any
 field-contract change, bumps the Profile version. Adding the `version` does not change wire component
 names (those are stable identifiers).
+
+**v1.1 and the major URN.** v1.1 loosens the contract for senders (every v1 payload stays valid) but
+adds a receiver duty: a renderer must now tolerate `metadata` on all 14 FROZEN types, not only
+`TimeSeriesChart`. The major URN is kept because the catalogId cannot distinguish v1 from v1.1
+payloads, so the amendment is only safe if v1 receivers already ignore unknown fields. A strict v1
+renderer that rejects unlisted fields must upgrade to accept `metadata` on every FROZEN type.
+
+**Profile changelog.** v1.1 (2026-10-09): TimeSeriesChart's typed metadata row removed; metadata is a
+cross-cutting free-form field on every FROZEN type; receivers MUST accept it. v1: initial freeze.
 
 ## Defining your own catalog (beyond the Profile)
 
@@ -625,8 +640,16 @@ Agent-card advertisement — the extension object lives under **`capabilities.ex
   extension `params` (vs only by `catalogId` reference). If `false`/absent, only `supportedCatalogIds`
   are honored and an inline catalog MUST be rejected.
 
-DataPart wire format:
+DataPart wire format — genuine, unresolved spec conflict; read before implementing:
+A2UI v0.9.1's own A2A binding (`a2ui_extension_specification.md`, "Data encoding") says the `data`
+field of the `DataPart` MUST be a bare array of A2UI messages, no wrapper key. A2A v0.3.0's own
+`DataPart.data` typing (`types.ts`) is `{[key: string]: any}` — a required JSON **object**, with no
+array member — so a bare-array `data` fails schema validation against a strict, spec-generated A2A
+client (A2A TCK, A2A Inspector, a typed client generated from the real spec). No published spec on
+either side resolves this; pick one and document the choice.
+
 ```json
+// (a) Spec-literal — matches A2UI's own binding; may fail strict A2A DataPart.data schema validation
 {
   "kind": "data",
   "data": [
@@ -635,9 +658,26 @@ DataPart wire format:
   ],
   "metadata": {"mimeType": "application/a2ui+json"}
 }
+
+// (b) Object-wrapped — matches A2A's DataPart.data typing; deviates from A2UI's own binding
+// (an SDK-specific resolution, not a citable canonical shape on either side)
+{
+  "kind": "data",
+  "data": {
+    "messages": [
+      {"version": "v0.9.1", "createSurface": {"surfaceId": "s1", "catalogId": "urn:a2ui-profile:standard:v1"}},
+      {"version": "v0.9.1", "updateComponents": {"surfaceId": "s1", "components": [{"id": "root", "component": "KpiCard", "data": {"path": "/kpi"}}]}}
+    ]
+  },
+  "metadata": {"mimeType": "application/a2ui+json"}
+}
 ```
-`data` MUST be a JSON array (even for one message). On per-message validation failure: log and
-continue the rest of the array; do not abort the batch.
+If you choose (b), advertise it via a non-normative agent-card extension param — e.g.
+`params.dataEncoding: "data.messages"` alongside `supportedCatalogIds` — so a strictly
+spec-conformant third-party A2UI Path-A renderer, built from the A2UI spec alone with no knowledge
+of your implementation, has a wire-discoverable way to find the message array instead of silently
+rendering nothing. Either way, on per-message validation failure inside the array: log and continue
+the rest of the array; do not abort the batch.
 
 ## AG-UI CUSTOM delivery
 
@@ -689,9 +729,13 @@ A2UI always arrives as an **array of messages**. One entry point folds them all,
 ```ts
 // AG-UI
 if (event.type === "CUSTOM" && event.name === "A2UI_UPDATE") processA2UiMessages(event.value.messages);
-// A2A DataPart
-if (part.kind === "data" && part.metadata?.mimeType === "application/a2ui+json")
-  processA2UiMessages(Array.isArray(part.data) ? part.data : []);
+// A2A DataPart — shape depends on which side of the conflict the server chose (see above);
+// check the agent card's `dataEncoding` hint if present, but fold gracefully either way
+if (part.kind === "data" && part.metadata?.mimeType === "application/a2ui+json") {
+  const raw = part.data;
+  const messages = Array.isArray(raw) ? raw : Array.isArray(raw?.messages) ? raw.messages : [];
+  processA2UiMessages(messages);
+}
 ```
 Accept the legacy MIME type `application/json+a2ui` (v0.8/v0.9) for interop, but treat
 `application/a2ui+json` (v0.9.1) as canonical.
@@ -768,7 +812,11 @@ full Path-A renderer when you only need data (use Path B).
 8. **Unvalidated LLM output** — validate every emission; lowercase `"text"` vs `"Text"` is the most common LLM error.
 9. **Missing `version`** on a message — fails schema validation.
 10. **Missing `catalogId`** in `createSurface` — required; LLMs drop it.
-11. **`data` not an array** in a DataPart — must be a JSON array even for one message.
+11. **`DataPart.data` shape mismatch with the server's chosen convention** — A2UI v0.9.1's own A2A
+    binding requires a bare array; A2A v0.3.0's own `DataPart.data` typing requires an object. No
+    spec resolves the conflict (see "DataPart wire format" above). A server choosing the
+    object-wrapped form (e.g. `{"messages": [...]}`) MUST advertise it via an agent-card
+    `dataEncoding` hint; a client MUST check for that hint rather than assuming either shape.
 12. **`action` without extension activation** — the agent never parses it.
 13. **Blocking the repaint on one bad message** — keep processing the array.
 14. **Emitting an Extended type to a Core-only client** — check `a2uiClientCapabilities` and degrade.
@@ -818,7 +866,9 @@ and a Path-B extractor should run before sending, and is exactly what the `/a2ui
 
 **Server (emit):** SDK initialized with `VERSION_0_9_1`; `generate_system_prompt(include_schema=True,
 include_examples=True)`; LLM output validated before `create_a2ui_part()`; `create_a2ui_part()` used
-(not manual dicts); `data` always an array; agent card advertises the A2UI extension; emitted Profile
+(not manual dicts); `DataPart.data` shape internally consistent with a documented convention (bare
+array or object-wrapped — see "DataPart wire format" above; advertise `dataEncoding` if
+object-wrapped); agent card advertises the A2UI extension; emitted Profile
 payloads match the frozen field contracts; Extended types gated on client capability.
 
 **Client (render):** all 4 message types handled; surface updated atomically before one repaint;

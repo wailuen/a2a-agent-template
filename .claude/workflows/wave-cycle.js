@@ -94,7 +94,7 @@ const WAVE_BASENAME = WAVE_FILE.split('/').pop()
 // wave touching only identity.py (e.g. a binding-key or kind-tag regression on the
 // dataclass every audience check relies on) previously dispatched no protocol advisor at
 // all. Mirrors sdk-wave.js's agent_sdk/auth/identity member.
-const AUTH_SURFACE = ['src/routes/oauth', 'src/auth/middleware', 'src/auth/oauth_tokens', 'src/auth/api_keys', 'src/auth/identity']
+const AUTH_SURFACE = ['src/routes/oauth', 'src/auth/middleware', 'src/auth/oauth_tokens', 'src/auth/api_keys', 'src/auth/identity', 'src/auth/oidc']
 const A2A_SURFACE  = ['src/routes/a2a', 'src/routes/agent_card', 'src/models/a2a'].concat(AUTH_SURFACE)
 const MCP_SURFACE  = ['src/routes/mcp'].concat(AUTH_SURFACE)
 const AGUI_SURFACE = ['src/routes/ag_ui'].concat(AUTH_SURFACE)
@@ -152,6 +152,48 @@ const WAVE_SCHEMA = {
           },
         },
       },
+    },
+  },
+}
+
+// RT-002 (w039 archival hygiene): two waves run concurrently against the same
+// working tree with no isolation between them produce an uncommitted blob no
+// single wave's history can be reviewed, reverted, or released independently
+// of the other — the exact failure this schema's guard exists to catch before
+// a SECOND wave's Implement phase starts stacking more uncommitted work on top.
+const CONCURRENCY_GUARD_SCHEMA = {
+  type: 'object',
+  required: ['otherActiveWaves', 'dirtyPathCount'],
+  additionalProperties: false,
+  properties: {
+    otherActiveWaves: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Basenames of other wave files (w[NNN]-*.md, excluding CHECKPOINT-*.md) ' +
+        'in workspace/todos/active/ besides this run\'s own wave file',
+    },
+    dirtyPathCount: {
+      type: 'integer',
+      description: 'Number of lines from `git status --porcelain` at repo root (modified + ' +
+        'staged + untracked paths, 0 if the working tree is clean)',
+    },
+  },
+}
+
+// RT-001 (w039/origin divergence): local `main` and `origin/main` can diverge silently —
+// each ahead of the other with no fast-forward possible — and a wave will happily archive
+// on top of that without ever noticing. See this schema's guard below, checked once right
+// after Parse, alongside the concurrency guard.
+const REMOTE_SYNC_SCHEMA = {
+  type: 'object',
+  required: ['behindCount'],
+  additionalProperties: false,
+  properties: {
+    behindCount: {
+      type: 'integer',
+      description: 'Output of `git rev-list --count main..origin/main` after `git fetch ' +
+        'origin main --quiet` (0 if origin/main is unreachable — no remote, no network — ' +
+        'or already an ancestor of main)',
     },
   },
 }
@@ -806,6 +848,70 @@ if (parseDeclaresTemplateScope) {
   }
 }
 
+// RT-002 (w039 archival hygiene): a second wave starting its Implement phase while an
+// EARLIER wave's file still sits in workspace/todos/active/ AND the working tree is
+// uncommitted stacks that earlier wave's uncommitted work underneath this run's own —
+// by the time either archives, neither can be committed, reviewed, or reverted as an
+// independent unit (the two wave's changes end up interleaved in the same diff with no
+// isolation). This was previously only a comment (WC-RT-005) noting the risk without
+// enforcing it. Checked once, right after Parse, before any file mutation this run
+// might make — a wave RESUMING itself (its own file already in active/) is not blocked,
+// only a genuinely OTHER wave file coexisting with dirty state.
+const concurrency = await callAgent(
+  'List every wave file directly inside workspace/todos/active/ that matches the ' +
+  'pattern w[0-9]+-*.md, EXCLUDING CHECKPOINT-*.md files and excluding the file at ' +
+  WAVE_FILE + ' itself (this run\'s own wave file — do not report it even if its ' +
+  'basename matches). Return their basenames as otherActiveWaves (empty array if none).\n\n' +
+  'Separately, run `git status --porcelain` at the repo root and return the number of ' +
+  'lines it prints as dirtyPathCount (0 if the working tree is clean).',
+  { schema: CONCURRENCY_GUARD_SCHEMA, label: 'concurrency-guard', phase: 'Parse' }
+)
+
+if (concurrency && concurrency.otherActiveWaves.length > 0 && concurrency.dirtyPathCount > 0) {
+  log('ERROR: wave ' + wave.waveId + ' cannot start — ' +
+      concurrency.otherActiveWaves.join(', ') + ' already sits in workspace/todos/active/ ' +
+      'and the working tree has ' + concurrency.dirtyPathCount + ' uncommitted path(s). ' +
+      'Commit or archive the other wave first (or re-run this wave from a dedicated ' +
+      'worktree) — running two waves against one uncommitted tree produces a diff neither ' +
+      'can be reviewed, reverted, or released independently of the other.')
+  return {
+    error: 'concurrent-wave-uncommitted',
+    waveId: wave.waveId,
+    otherActiveWaves: concurrency.otherActiveWaves,
+    dirtyPathCount: concurrency.dirtyPathCount,
+  }
+}
+
+// RT-001 (w039/origin divergence): w039 landed and archived on a local `main` that was,
+// unnoticed, simultaneously 5 commits ahead AND 14 commits behind `origin/main` — v0.6.0
+// and v0.7.0 were already tagged upstream and unmerged into this history, and every one of
+// w039's own scope files had also changed upstream in the gap. A wave "landed" on a branch
+// that cannot be shipped without a later merge is not landed. Checked once, right after
+// Parse — same point as the concurrency guard above — so a diverged branch is caught before
+// Implement does any work that later has to be reconciled against an upstream nobody looked
+// at. Fetch failure (no `origin` remote, no network) degrades to behindCount 0 rather than
+// blocking every wave in an offline or remoteless repo.
+const remoteSync = await callAgent(
+  'Run `git fetch origin main --quiet` at the repo root (ignore failure — no configured ' +
+  '`origin` remote or no network access both mean this check does not apply). Then run ' +
+  '`git rev-list --count main..origin/main` and return the printed integer as behindCount ' +
+  '(0 if that command fails for any reason, e.g. no such remote or no such branch).',
+  { schema: REMOTE_SYNC_SCHEMA, label: 'remote-sync-guard', phase: 'Parse' }
+)
+
+if (remoteSync && remoteSync.behindCount > 0) {
+  log('ERROR: wave ' + wave.waveId + ' cannot start — local main is ' +
+      remoteSync.behindCount + ' commit(s) behind origin/main. Fetch and merge or rebase ' +
+      'onto origin/main first, run the full suite + mypy on the merged tree, and ' +
+      're-verify this wave\'s acceptance criteria against the post-merge code before ' +
+      'Implement — work landed on a diverged branch is not landed.')
+  return {
+    error: 'behind-origin',
+    waveId: wave.waveId,
+    behindCount: remoteSync.behindCount,
+  }
+}
+
 log('Wave ' + wave.waveId + ': ' + wave.groups.length + ' group(s), ' +
     wave.allScope.length + ' scope path(s) (' + wave.allCreates.length + ' create / ' +
     wave.allModifies.length + ' modify), lrnNext=' + wave.lrnNext)
@@ -1023,7 +1129,48 @@ while (remainingGroups.length > 0) {
 // ─── phase 3: unit redteam (per group, zero-tolerance) ───────────────────────
 phase('Unit Redteam')
 
-for (const group of wave.groups) {
+// Groups are partitioned by non-overlapping file scope (the planner groups conflicting
+// todos together — the same guarantee Implement relies on to run a tier concurrently), so
+// every group's review → diagnose → fix loop is independent and all groups run at once.
+// The one shared resource is the pytest gate: it reads the WHOLE repo, so a gate running
+// while a neighbouring group's fix agents are mid-edit could grade a transient state and
+// misattribute the failure (LRN-017: the gate's exitCode is the sole authoritative signal —
+// it must never be uncertain about what it graded). The mutate-and-verify section of each
+// round (debug → fix → gate → fix-tests → re-gate) is therefore serialised across groups by
+// gateLock; the read-only rt review call stays outside the lock so group B can review while
+// group A fixes-and-gates. A stale review read of a neighbour's file mid-edit is the same
+// self-correcting risk Implement already accepts — it yields a finding that is re-checked
+// next round, never a wrong gate verdict.
+let gateLock = Promise.resolve()
+function withGateLock(fn) {
+  const run = gateLock.then(fn, fn)                        // run after the queue ahead of it, whatever its outcome
+  gateLock = run.then(function() {}, function() {})      // keep the chain alive even if fn throws
+  return run
+}
+
+// Disjointness guard: the concurrent path is only safe while no two groups share a scope
+// path. Two scope paths collide when equal, or when one is a directory prefix of the other.
+// If the planner invariant does not hold for this wave, warn and fall back to the
+// one-group-at-a-time order (gateLock is then uncontended and behaves as a pass-through).
+function scopePathsOverlap(a, b) {
+  if (a === b) return true
+  const aDir = a.charAt(a.length - 1) === '/' ? a : a + '/'
+  const bDir = b.charAt(b.length - 1) === '/' ? b : b + '/'
+  return b.indexOf(aDir) === 0 || a.indexOf(bDir) === 0
+}
+const scopeOverlaps = []
+wave.groups.forEach(function(a, ai) {
+  wave.groups.slice(ai + 1).forEach(function(b) {
+    const shared = a.scope.filter(function(p) {
+      return b.scope.some(function(q) { return scopePathsOverlap(p, q) })
+    })
+    if (shared.length > 0) scopeOverlaps.push({ a: a.label, b: b.label, shared: shared })
+  })
+})
+
+// Resolves to { label, rounds } on every normal exit so the fan-out below can tell a
+// finished group from one whose thunk threw (parallel() maps a throw to null).
+const runUnitRedteamForGroup = async function(group) {
   log('Unit redteam — group ' + group.label)
   let uRound       = 0
   let prevSigs     = new Set()
@@ -1170,113 +1317,120 @@ for (const group of wave.groups) {
       break
     }
 
-    // RT-006 / GH-132: debug REPLACES the fix fan-out (rather than running alongside it) at
-    // round 4+ (uRound > 3) or on stall — the debug agent already fixes at the root itself
-    // (see its prompt below), so also dispatching the per-file/batched fix fan-out in the same
-    // round duplicated the fix work and compounded agent cost. Round 5 exits via deferred note
-    // above.
-    const escalateToDebug = uRound > 3 || stalled
-    if (escalateToDebug) {
-      log((stalled ? 'Stall detected — ' : 'Round 4+ — ') + 'escalating to debug agent (replaces fix fan-out this round)')
-      await callAgent(
-        'Fix-loop requires fresh-lens analysis' + (stalled ? ' (stalled: same findings across 2 rounds)' : ' (round ' + uRound + ')') + '.\n\n' +
-        'Prior findings:\n' + JSON.stringify(blocking, null, 2) + '\n\n' +
-        'Scope:\n' + group.scope.join('\n') + '\n\n' +
-        'Read code cold. Diagnose root cause. Fix at the root.',
-        { label: 'debug:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam', agentType: 'debug' }
-      )
-    }
-    prevSigs = curSigs
-
-    if (!escalateToDebug) {
-      // GH-132: batch into ONE agent covering every file this round unless the round's
-      // blocking findings span more files than FIX_BATCH_FILE_THRESHOLD — past that, fall
-      // back to the original one-agent-per-file parallel fan-out.
-      const byFile = {}
-      for (const f of blocking) {
-        if (!byFile[f.file]) byFile[f.file] = []
-        byFile[f.file].push(f)
+    // Mutate-and-verify critical section — serialised across groups by gateLock (see the
+    // phase preamble). Resolves true when this round hit a loop-exit path (null gate, or
+    // re-gate still red after the test-fix) so the caller breaks out of the round loop.
+    const exitLoop = await withGateLock(async function() {
+      // RT-006 / GH-132: debug REPLACES the fix fan-out (rather than running alongside it) at
+      // round 4+ (uRound > 3) or on stall — the debug agent already fixes at the root itself
+      // (see its prompt below), so also dispatching the per-file/batched fix fan-out in the same
+      // round duplicated the fix work and compounded agent cost. Round 5 exits via deferred note
+      // above.
+      const escalateToDebug = uRound > 3 || stalled
+      if (escalateToDebug) {
+        log((stalled ? 'Stall detected — ' : 'Round 4+ — ') + 'escalating to debug agent (replaces fix fan-out this round)')
+        await callAgent(
+          'Fix-loop requires fresh-lens analysis' + (stalled ? ' (stalled: same findings across 2 rounds)' : ' (round ' + uRound + ')') + '.\n\n' +
+          'Prior findings:\n' + JSON.stringify(blocking, null, 2) + '\n\n' +
+          'Scope:\n' + group.scope.join('\n') + '\n\n' +
+          'Read code cold. Diagnose root cause. Fix at the root.',
+          { label: 'debug:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam', agentType: 'debug' }
+        )
       }
-      const files = Object.keys(byFile)
+      prevSigs = curSigs
 
-      const fixTasks = files.length > FIX_BATCH_FILE_THRESHOLD
-        ? files.map(function(file) {
-            return function() {
+      if (!escalateToDebug) {
+        // GH-132: batch into ONE agent covering every file this round unless the round's
+        // blocking findings span more files than FIX_BATCH_FILE_THRESHOLD — past that, fall
+        // back to the original one-agent-per-file parallel fan-out.
+        const byFile = {}
+        for (const f of blocking) {
+          if (!byFile[f.file]) byFile[f.file] = []
+          byFile[f.file].push(f)
+        }
+        const files = Object.keys(byFile)
+
+        const fixTasks = files.length > FIX_BATCH_FILE_THRESHOLD
+          ? files.map(function(file) {
+              return function() {
+                return callAgent(
+                  'Fix these findings in ' + file + ':\n\n' +
+                  JSON.stringify(byFile[file], null, 2) + '\n\n' +
+                  'Enforce SDK SI-1…SI-7 in your fix. Run pytest -q after.',
+                  { label: 'fix:unit:' + group.label + ':r' + uRound + ':' + file.replace(/\//g, '-'),
+                    phase: 'Unit Redteam', agentType: 'python-implementer' }
+                )
+              }
+            })
+          : [function() {
               return callAgent(
-                'Fix these findings in ' + file + ':\n\n' +
-                JSON.stringify(byFile[file], null, 2) + '\n\n' +
-                'Enforce SDK SI-1…SI-7 in your fix. Run pytest -q after.',
-                { label: 'fix:unit:' + group.label + ':r' + uRound + ':' + file.replace(/\//g, '-'),
-                  phase: 'Unit Redteam', agentType: 'python-implementer' }
+                'Fix these findings, grouped by file:\n\n' +
+                JSON.stringify(byFile, null, 2) + '\n\n' +
+                'Enforce SDK SI-1…SI-7 in your fixes. Run pytest -q after.',
+                { label: 'fix:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam', agentType: 'python-implementer' }
               )
-            }
-          })
-        : [function() {
-            return callAgent(
-              'Fix these findings, grouped by file:\n\n' +
-              JSON.stringify(byFile, null, 2) + '\n\n' +
-              'Enforce SDK SI-1…SI-7 in your fixes. Run pytest -q after.',
-              { label: 'fix:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam', agentType: 'python-implementer' }
-            )
-          }]
+            }]
 
-      await parallel(fixTasks)
-    }
+        await parallel(fixTasks)
+      }
 
-    // GH-19: consume gate result — red suite blocks loop continuation.
-    // RT-001: fail-closed — null gate response is unknown state, treated as failure.
-    const unitGate = await callAgent(
-      'Run: python -m pytest -q\n' +
-      'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
-      '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
-      { schema: GATE_SCHEMA, label: 'gate:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam' }
-    )
-    if (!unitGate) {
-      log('WARNING: unit gate agent returned null for group ' + group.label + ' round ' + uRound + ' — treating as gate failure (unknown state)')
-      testsRed = true
-      // WC-003: write a deferred note so the operator has a durable artifact indicating
-      // which group's gate failed, the round, and how to retry. Every other loop-exit
-      // path writes a deferred note; this path must too (RT-002: null gate blocks loop).
-      await callAgent(
-        'Write workspace/todos/deferred/' + wave.waveId + '-group-' + group.label + '-gate-null-r' + uRound + '.md\n\n' +
-        'Include: wave ID (' + wave.waveId + '), group (' + group.label + '), date (' + TODAY + '),\n' +
-        'round (' + uRound + '), reason: unit gate agent returned null (unknown test state).\n' +
-        'Instruction: "Re-run /wave ' + wave.waveId + ' to retry gate for this group."',
-        { label: 'defer:unit:' + group.label + ':gate-null:r' + uRound, phase: 'Unit Redteam' }
-      )
-      // RT-002: null gate blocks loop continuation — do not silently proceed.
-      break
-    }
-    if (unitGate.exitCode !== 0) {
-      testsRed = true
-      log('Gate RED (' + unitGate.failCount + ' failing) — dispatching test-fix agent')
-      await callAgent(
-        'Fix the failing tests below. Read the test file and the source it covers.\n' +
-        'Failing tests:\n' + unitGate.failures.join('\n') + '\n\n' +
-        'Run `python -m pytest -q <failing-test-file>` to confirm GREEN before finishing.',
-        { label: 'fix:tests:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam' }
-      )
-      // RT-002: re-gate after test-fix to verify the fix succeeded before continuing the loop.
-      const unitReGate = await callAgent(
+      // GH-19: consume gate result — red suite blocks loop continuation.
+      // RT-001: fail-closed — null gate response is unknown state, treated as failure.
+      const unitGate = await callAgent(
         'Run: python -m pytest -q\n' +
         'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
         '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
-        { schema: GATE_SCHEMA, label: 'gate:unit:' + group.label + ':r' + uRound + ':recheck', phase: 'Unit Redteam' }
+        { schema: GATE_SCHEMA, label: 'gate:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam' }
       )
-      // RT-001: fail-closed — null re-gate is still unknown, treat as red.
-      if (!unitReGate || unitReGate.exitCode !== 0) {
-        const failCount = unitReGate ? unitReGate.failCount : '?'
-        log('Re-gate still RED (' + failCount + ' failing) after test-fix — deferring group ' + group.label)
+      if (!unitGate) {
+        log('WARNING: unit gate agent returned null for group ' + group.label + ' round ' + uRound + ' — treating as gate failure (unknown state)')
+        testsRed = true
+        // WC-003: write a deferred note so the operator has a durable artifact indicating
+        // which group's gate failed, the round, and how to retry. Every other loop-exit
+        // path writes a deferred note; this path must too (RT-002: null gate blocks loop).
         await callAgent(
-          'Write workspace/todos/deferred/' + wave.waveId + '-group-' + group.label + '-tests-red-r' + uRound + '.md\n\n' +
+          'Write workspace/todos/deferred/' + wave.waveId + '-group-' + group.label + '-gate-null-r' + uRound + '.md\n\n' +
           'Include: wave ID (' + wave.waveId + '), group (' + group.label + '), date (' + TODAY + '),\n' +
-          'round (' + uRound + '), reason: test suite RED after fix attempt.\n' +
-          'Instruction: "Fix failing tests and re-run /wave ' + wave.waveId + '".',
-          { label: 'defer:unit:' + group.label + ':tests-red:r' + uRound, phase: 'Unit Redteam' }
+          'round (' + uRound + '), reason: unit gate agent returned null (unknown test state).\n' +
+          'Instruction: "Re-run /wave ' + wave.waveId + ' to retry gate for this group."',
+          { label: 'defer:unit:' + group.label + ':gate-null:r' + uRound, phase: 'Unit Redteam' }
         )
-        break
+        // RT-002: null gate blocks loop continuation — do not silently proceed.
+        return true
       }
-    }
+      if (unitGate.exitCode !== 0) {
+        testsRed = true
+        log('Gate RED (' + unitGate.failCount + ' failing) — dispatching test-fix agent')
+        await callAgent(
+          'Fix the failing tests below. Read the test file and the source it covers.\n' +
+          'Failing tests:\n' + unitGate.failures.join('\n') + '\n\n' +
+          'Run `python -m pytest -q <failing-test-file>` to confirm GREEN before finishing.',
+          { label: 'fix:tests:unit:' + group.label + ':r' + uRound, phase: 'Unit Redteam' }
+        )
+        // RT-002: re-gate after test-fix to verify the fix succeeded before continuing the loop.
+        const unitReGate = await callAgent(
+          'Run: python -m pytest -q\n' +
+          'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
+          '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
+          { schema: GATE_SCHEMA, label: 'gate:unit:' + group.label + ':r' + uRound + ':recheck', phase: 'Unit Redteam' }
+        )
+        // RT-001: fail-closed — null re-gate is still unknown, treat as red.
+        if (!unitReGate || unitReGate.exitCode !== 0) {
+          const failCount = unitReGate ? unitReGate.failCount : '?'
+          log('Re-gate still RED (' + failCount + ' failing) after test-fix — deferring group ' + group.label)
+          await callAgent(
+            'Write workspace/todos/deferred/' + wave.waveId + '-group-' + group.label + '-tests-red-r' + uRound + '.md\n\n' +
+            'Include: wave ID (' + wave.waveId + '), group (' + group.label + '), date (' + TODAY + '),\n' +
+            'round (' + uRound + '), reason: test suite RED after fix attempt.\n' +
+            'Instruction: "Fix failing tests and re-run /wave ' + wave.waveId + '".',
+            { label: 'defer:unit:' + group.label + ':tests-red:r' + uRound, phase: 'Unit Redteam' }
+          )
+          return true
+        }
+      }
+      return false
+    })
+    if (exitLoop) break
   }
 
   // RT-009: written ONCE, after the loop, from ONE place — covers every exit path (clean,
@@ -1294,6 +1448,41 @@ for (const group of wave.groups) {
       { label: 'defer:unit:' + group.label + ':medium-low', phase: 'Unit Redteam' }
     )
   }
+  return { label: group.label, rounds: uRound }
+}
+
+if (scopeOverlaps.length > 0) {
+  scopeOverlaps.forEach(function(o) {
+    log('WARNING: groups ' + o.a + ' and ' + o.b + ' share scope path(s): ' + o.shared.join(', '))
+  })
+  log('Scope overlap detected — planner disjointness invariant violated; running Unit Redteam ' +
+      'one group at a time for this wave (concurrent path skipped)')
+  for (const group of wave.groups) {
+    await runUnitRedteamForGroup(group)
+  }
+} else {
+  if (wave.groups.length > 1) {
+    log('Unit redteam — ' + wave.groups.length + ' groups concurrently (fix + gate serialised): ' +
+        wave.groups.map(function(g) { return g.label }).join(', '))
+  }
+  const unitResults = await parallel(wave.groups.map(function(group) {
+    return function() { return runUnitRedteamForGroup(group) }
+  }))
+  // parallel() resolves a thrown thunk to null instead of rejecting — surface it so a group
+  // whose round loop aborted mid-way is not mistaken for a clean exit. Fail closed: an
+  // aborted group never established a verdict, so archive must not proceed as if clean.
+  // A budget-exceeded throw inside a group thunk is also mapped to null by parallel() —
+  // re-raise it here so the hard backstop still stops the wave loudly.
+  if (agentCallCount > AGENT_CALL_BUDGET) {
+    throw new Error('agent-call budget exceeded (' + AGENT_CALL_BUDGET + ' calls) for this wave')
+  }
+  unitResults.forEach(function(r, i) {
+    if (!r) {
+      log('WARNING: unit redteam for group ' + wave.groups[i].label + ' aborted with an error before a clean exit — not clean; re-run /wave ' + wave.waveId)
+      protocolBlocked = true
+      redteamUnknownBlocked = true
+    }
+  })
 }
 
 // ─── phase 4: phase redteam (whole wave, zero-tolerance) ─────────────────────
@@ -1306,235 +1495,249 @@ let prevSigs = new Set()
 let phaseNonBlocking = []
 let phaseNonBlockingSigs = new Set()
 
-while (true) {
-  pRound++
+// LRN-136: Phase Redteam reviews wave.allScope — the UNION of every group's scope. On a
+// single-group wave that union IS the one group's scope, which Unit Redteam has just
+// zero-tolerance-cleared with the same review dimensions, the same debug escalation
+// (round 4+ / stall) and the same fix → gate machinery. A second pass over the same files
+// adds no coverage — there is no second group, so no cross-group interaction surface —
+// while adding up to 8 more rounds of dispatches. Multi-group waves MUST still run it:
+// only a whole-wave pass can catch e.g. group A changing a signature that group B's
+// already-reviewed code calls. Skipping leaves every downstream variable in the state a
+// clean pass would (pRound stays 0) — nothing after this block special-cases it.
+if (wave.groups.length === 1) {
+  log('Phase Redteam skipped — single-group wave (' + wave.groups[0].label + '): Unit Redteam already reviewed this exact scope ' +
+      'with the same review dimensions; no cross-group interaction surface exists.')
+} else {
+  while (true) {
+    pRound++
 
-  const rt = await callAgent(
-    'Adversarial review of the full wave ' + wave.waveId + '.\n\n' +
-    'Scope (all Creates: AND Modifies: paths across every group):\n' +
-    wave.allScope.join('\n') + '\n\n' +
-    'Also check transitive callers and importers. Re-expand scope every round.\n\n' +
-    'Run all 8 dimensions. SDK Security Invariants (SI-1…SI-7) fail closed.\n\n' +
-    'Return structured findings.',
-    { schema: RT_SCHEMA, label: 'rt:phase:r' + pRound, phase: 'Phase Redteam',
-      agentType: 'redteam' }
-  )
+    const rt = await callAgent(
+      'Adversarial review of the full wave ' + wave.waveId + '.\n\n' +
+      'Scope (all Creates: AND Modifies: paths across every group):\n' +
+      wave.allScope.join('\n') + '\n\n' +
+      'Also check transitive callers and importers. Re-expand scope every round.\n\n' +
+      'Run all 8 dimensions. SDK Security Invariants (SI-1…SI-7) fail closed.\n\n' +
+      'Return structured findings.',
+      { schema: RT_SCHEMA, label: 'rt:phase:r' + pRound, phase: 'Phase Redteam',
+        agentType: 'redteam' }
+    )
 
-  // RT-004: null redteam response is unknown state — must not be treated as clean (fail-open).
-  // WC-002: also enforce the budget cap on null rounds so persistent null responses
-  // cannot loop indefinitely — the budget check is mirrored here before the continue.
-  if (!rt) {
-    log('WARNING: phase redteam agent returned null at round ' + pRound + ' — treating as unknown (not clean)')
-    if (pRound >= 8) {
-      log('Null responses exceeded phase round budget — deferring')
-      await callAgent(
-        'Write workspace/todos/deferred/' + wave.waveId + '-phase-rt-null-budget.md\n\n' +
-        'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
-        'round (' + pRound + '), reason: phase redteam agent returned null on every round — unknown state.\n' +
-        'Instruction: "Re-run /wave ' + wave.waveId + ' to retry phase redteam."',
-        { label: 'defer:phase:rt-null-budget', phase: 'Phase Redteam' }
-      )
-      // RT-003 (this wave, LRN-032): mirrors the unit loop's null-response budget fix —
-      // an UNKNOWN verdict must block archive at least as hard as one where findings
-      // actually survived. redteamUnknownBlocked (not phaseBudgetBlocked) so the
-      // archive-skip message names the real cause.
-      protocolBlocked = true
-      redteamUnknownBlocked = true
+    // RT-004: null redteam response is unknown state — must not be treated as clean (fail-open).
+    // WC-002: also enforce the budget cap on null rounds so persistent null responses
+    // cannot loop indefinitely — the budget check is mirrored here before the continue.
+    if (!rt) {
+      log('WARNING: phase redteam agent returned null at round ' + pRound + ' — treating as unknown (not clean)')
+      if (pRound >= 8) {
+        log('Null responses exceeded phase round budget — deferring')
+        await callAgent(
+          'Write workspace/todos/deferred/' + wave.waveId + '-phase-rt-null-budget.md\n\n' +
+          'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
+          'round (' + pRound + '), reason: phase redteam agent returned null on every round — unknown state.\n' +
+          'Instruction: "Re-run /wave ' + wave.waveId + ' to retry phase redteam."',
+          { label: 'defer:phase:rt-null-budget', phase: 'Phase Redteam' }
+        )
+        // RT-003 (this wave, LRN-032): mirrors the unit loop's null-response budget fix —
+        // an UNKNOWN verdict must block archive at least as hard as one where findings
+        // actually survived. redteamUnknownBlocked (not phaseBudgetBlocked) so the
+        // archive-skip message names the real cause.
+        protocolBlocked = true
+        redteamUnknownBlocked = true
+        break
+      }
+      // RT-004: do NOT reset prevSigs — preserve the last real finding set so stall detection
+      // fires correctly on the next round if findings have not changed. Resetting prevSigs here
+      // would defeat stall detection: a null round followed by a round with the same findings as
+      // the prior real round would not trigger sigsEqual because prevSigs was cleared.
+      // continue to next round — do not fall through to fix/debug logic; prevSigs not reset so stall detection remains valid
+      continue
+    }
+
+    // RT-016: a single invariant replaces the old two-special-case guard — see the matching
+    // unit-loop comment above for the PARTIAL-mismatch gap this closes. Any inequality between
+    // findingsCount and the actual array length is unknown state — fail closed exactly like a
+    // null response, with the same round-budget/deferred-note handling; never self-heal by
+    // overwriting findingsCount, since a partial mismatch cannot be trusted enough to correct.
+    if (rt.findingsCount !== rt.findings.length) {
+      log('WARNING: findingsCount=' + rt.findingsCount + ' does not match findings array length ' +
+          rt.findings.length + ' at round ' + pRound + ' — treating as unknown (not clean)')
+      if (pRound >= 8) {
+        log('Findings-count mismatch exceeded phase round budget — deferring')
+        await callAgent(
+          'Write workspace/todos/deferred/' + wave.waveId + '-phase-rt-mismatch-budget.md\n\n' +
+          'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
+          'round (' + pRound + '), reason: phase redteam agent reported findingsCount=' + rt.findingsCount +
+          ' but findings array has ' + rt.findings.length + ' item(s) — unknown state on every round.\n' +
+          'Instruction: "Re-run /wave ' + wave.waveId + ' to retry phase redteam."',
+          { label: 'defer:phase:rt-mismatch-budget', phase: 'Phase Redteam' }
+        )
+        // RT-003 (this wave, LRN-032): this exit is NEW in this wave and fails closed exactly
+        // like the null-response branch above. A findingsCount/findings mismatch on every
+        // round is an UNKNOWN verdict; block archive via redteamUnknownBlocked.
+        protocolBlocked = true
+        redteamUnknownBlocked = true
+        break
+      }
+      // Do NOT reset prevSigs — preserve the last real finding set so stall detection fires
+      // correctly on the next round if findings have not changed.
+      continue
+    }
+
+    // GH-132: severity floor — only critical/high findings block the loop. RT-009: medium/low
+    // findings are accumulated (deduped) into phaseNonBlocking every round and written to ONE
+    // deferred note after the loop ends — on every exit path, not only clean exit.
+    const blocking = blockingFindings(rt.findings)
+    const nonBlocking = nonBlockingFindings(rt.findings)
+    accumulateNonBlocking(phaseNonBlocking, phaseNonBlockingSigs, rt.findings)
+
+    if (blocking.length === 0) {
+      log('Phase redteam clean at round ' + pRound + ' (no critical/high findings)' +
+          (nonBlocking.length > 0 ? '; ' + nonBlocking.length + ' medium/low finding(s) deferred' : ''))
       break
     }
-    // RT-004: do NOT reset prevSigs — preserve the last real finding set so stall detection
-    // fires correctly on the next round if findings have not changed. Resetting prevSigs here
-    // would defeat stall detection: a null round followed by a round with the same findings as
-    // the prior real round would not trigger sigsEqual because prevSigs was cleared.
-    // continue to next round — do not fall through to fix/debug logic; prevSigs not reset so stall detection remains valid
-    continue
-  }
 
-  // RT-016: a single invariant replaces the old two-special-case guard — see the matching
-  // unit-loop comment above for the PARTIAL-mismatch gap this closes. Any inequality between
-  // findingsCount and the actual array length is unknown state — fail closed exactly like a
-  // null response, with the same round-budget/deferred-note handling; never self-heal by
-  // overwriting findingsCount, since a partial mismatch cannot be trusted enough to correct.
-  if (rt.findingsCount !== rt.findings.length) {
-    log('WARNING: findingsCount=' + rt.findingsCount + ' does not match findings array length ' +
-        rt.findings.length + ' at round ' + pRound + ' — treating as unknown (not clean)')
+    log('Phase redteam round ' + pRound + ': ' + blocking.length + ' blocking finding(s)' +
+        (nonBlocking.length > 0 ? ' (+' + nonBlocking.length + ' medium/low, non-blocking)' : ''))
+
+    const curSigs = sigs(blocking)
+    const pStalled = pRound > 1 && sigsEqual(curSigs, prevSigs)
+
+    // RT-003: codify accumulation MUST happen before the round-budget exit below (and every other
+    // exit path from here on) — GH-132's severity floor means reaching the round cap now signals
+    // SURVIVING critical/high findings, not a leftover low nit, so they must reach the Codify LRN
+    // pass / SDK-issue scan even when the loop is about to give up on the whole wave.
+    // RT-011: do NOT filter on f.codify — same reasoning as the unit loop above: a critical/high
+    // finding missing the required "Codify:" line must not silently vanish from the Codify LRN
+    // pass AND the SDK issue scan. Warn by id; the codify agent synthesises from description/fix
+    // (it already receives the full finding JSON) when codify itself is absent.
+    const missingCodify = blocking.filter(function(f) { return !f.codify })
+    if (missingCodify.length > 0) {
+      log('WARNING: ' + missingCodify.length + ' critical/high finding(s) missing a Codify: line: ' +
+          missingCodify.map(function(f) { return f.id }).join(', '))
+    }
+    const highFindings = blocking
+    allHighFindings.push.apply(allHighFindings, highFindings)
+
+    // Budget-exit check before debug — avoids wasting a debug agent call that's immediately
+    // abandoned. RT-003: also marks the wave as blocked and writes a deferred note (mirroring the
+    // unit loop's round-budget exit) — reaching this cap means critical/high findings survived
+    // every fix attempt across the whole wave, so it must not archive as if clean.
     if (pRound >= 8) {
-      log('Findings-count mismatch exceeded phase round budget — deferring')
+      log('Phase round budget exhausted — deferring and blocking archive (surviving critical/high findings)')
       await callAgent(
-        'Write workspace/todos/deferred/' + wave.waveId + '-phase-rt-mismatch-budget.md\n\n' +
+        'Write workspace/todos/deferred/' + wave.waveId + '-phase-budget-exhausted.md\n\n' +
         'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
-        'round (' + pRound + '), reason: phase redteam agent reported findingsCount=' + rt.findingsCount +
-        ' but findings array has ' + rt.findings.length + ' item(s) — unknown state on every round.\n' +
-        'Instruction: "Re-run /wave ' + wave.waveId + ' to retry phase redteam."',
-        { label: 'defer:phase:rt-mismatch-budget', phase: 'Phase Redteam' }
+        'round count (' + pRound + '), and the final findings:\n' +
+        JSON.stringify(rt.findings, null, 2) + '\n\n' +
+        'Instruction in the file: "Fix remaining findings, then re-run /wave ' + wave.waveId + '".',
+        { label: 'defer:phase:budget-exhausted', phase: 'Phase Redteam' }
       )
-      // RT-003 (this wave, LRN-032): this exit is NEW in this wave and fails closed exactly
-      // like the null-response branch above. A findingsCount/findings mismatch on every
-      // round is an UNKNOWN verdict; block archive via redteamUnknownBlocked.
+      phaseBudgetBlocked = true
       protocolBlocked = true
-      redteamUnknownBlocked = true
       break
     }
-    // Do NOT reset prevSigs — preserve the last real finding set so stall detection fires
-    // correctly on the next round if findings have not changed.
-    continue
-  }
 
-  // GH-132: severity floor — only critical/high findings block the loop. RT-009: medium/low
-  // findings are accumulated (deduped) into phaseNonBlocking every round and written to ONE
-  // deferred note after the loop ends — on every exit path, not only clean exit.
-  const blocking = blockingFindings(rt.findings)
-  const nonBlocking = nonBlockingFindings(rt.findings)
-  accumulateNonBlocking(phaseNonBlocking, phaseNonBlockingSigs, rt.findings)
-
-  if (blocking.length === 0) {
-    log('Phase redteam clean at round ' + pRound + ' (no critical/high findings)' +
-        (nonBlocking.length > 0 ? '; ' + nonBlocking.length + ' medium/low finding(s) deferred' : ''))
-    break
-  }
-
-  log('Phase redteam round ' + pRound + ': ' + blocking.length + ' blocking finding(s)' +
-      (nonBlocking.length > 0 ? ' (+' + nonBlocking.length + ' medium/low, non-blocking)' : ''))
-
-  const curSigs = sigs(blocking)
-  const pStalled = pRound > 1 && sigsEqual(curSigs, prevSigs)
-
-  // RT-003: codify accumulation MUST happen before the round-budget exit below (and every other
-  // exit path from here on) — GH-132's severity floor means reaching the round cap now signals
-  // SURVIVING critical/high findings, not a leftover low nit, so they must reach the Codify LRN
-  // pass / SDK-issue scan even when the loop is about to give up on the whole wave.
-  // RT-011: do NOT filter on f.codify — same reasoning as the unit loop above: a critical/high
-  // finding missing the required "Codify:" line must not silently vanish from the Codify LRN
-  // pass AND the SDK issue scan. Warn by id; the codify agent synthesises from description/fix
-  // (it already receives the full finding JSON) when codify itself is absent.
-  const missingCodify = blocking.filter(function(f) { return !f.codify })
-  if (missingCodify.length > 0) {
-    log('WARNING: ' + missingCodify.length + ' critical/high finding(s) missing a Codify: line: ' +
-        missingCodify.map(function(f) { return f.id }).join(', '))
-  }
-  const highFindings = blocking
-  allHighFindings.push.apply(allHighFindings, highFindings)
-
-  // Budget-exit check before debug — avoids wasting a debug agent call that's immediately
-  // abandoned. RT-003: also marks the wave as blocked and writes a deferred note (mirroring the
-  // unit loop's round-budget exit) — reaching this cap means critical/high findings survived
-  // every fix attempt across the whole wave, so it must not archive as if clean.
-  if (pRound >= 8) {
-    log('Phase round budget exhausted — deferring and blocking archive (surviving critical/high findings)')
-    await callAgent(
-      'Write workspace/todos/deferred/' + wave.waveId + '-phase-budget-exhausted.md\n\n' +
-      'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
-      'round count (' + pRound + '), and the final findings:\n' +
-      JSON.stringify(rt.findings, null, 2) + '\n\n' +
-      'Instruction in the file: "Fix remaining findings, then re-run /wave ' + wave.waveId + '".',
-      { label: 'defer:phase:budget-exhausted', phase: 'Phase Redteam' }
-    )
-    phaseBudgetBlocked = true
-    protocolBlocked = true
-    break
-  }
-
-  // RT-006 / GH-132: debug REPLACES the fix fan-out (rather than running alongside it) at
-  // round 4+ (pRound > 3) or on stall — the debug agent already fixes at the root itself, so
-  // also dispatching the per-file/batched fix fan-out in the same round duplicated the fix
-  // work and compounded agent cost. Round 8 exits above.
-  const pEscalateToDebug = pRound > 3 || pStalled
-  if (pEscalateToDebug) {
-    log((pStalled ? 'Stall detected — ' : 'Round 4+ — ') + 'escalating to debug agent (replaces fix fan-out this round)')
-    await callAgent(
-      'Phase fix-loop requires fresh-lens analysis' + (pStalled ? ' (stalled)' : ' (round ' + pRound + ')') + '.\n\n' +
-      'Findings:\n' + JSON.stringify(blocking, null, 2) + '\n\n' +
-      'Scope:\n' + wave.allScope.join('\n') + '\n\n' +
-      'Read cold; diagnose; fix at root.',
-      { label: 'debug:phase:r' + pRound, phase: 'Phase Redteam', agentType: 'debug' }
-    )
-  }
-  prevSigs = curSigs
-
-  if (!pEscalateToDebug) {
-    // GH-132: batch into ONE agent covering every file this round unless the round's blocking
-    // findings span more files than FIX_BATCH_FILE_THRESHOLD — past that, fall back to the
-    // original one-agent-per-file parallel fan-out.
-    const byFile = {}
-    for (const f of blocking) {
-      if (!byFile[f.file]) byFile[f.file] = []
-      byFile[f.file].push(f)
+    // RT-006 / GH-132: debug REPLACES the fix fan-out (rather than running alongside it) at
+    // round 4+ (pRound > 3) or on stall — the debug agent already fixes at the root itself, so
+    // also dispatching the per-file/batched fix fan-out in the same round duplicated the fix
+    // work and compounded agent cost. Round 8 exits above.
+    const pEscalateToDebug = pRound > 3 || pStalled
+    if (pEscalateToDebug) {
+      log((pStalled ? 'Stall detected — ' : 'Round 4+ — ') + 'escalating to debug agent (replaces fix fan-out this round)')
+      await callAgent(
+        'Phase fix-loop requires fresh-lens analysis' + (pStalled ? ' (stalled)' : ' (round ' + pRound + ')') + '.\n\n' +
+        'Findings:\n' + JSON.stringify(blocking, null, 2) + '\n\n' +
+        'Scope:\n' + wave.allScope.join('\n') + '\n\n' +
+        'Read cold; diagnose; fix at root.',
+        { label: 'debug:phase:r' + pRound, phase: 'Phase Redteam', agentType: 'debug' }
+      )
     }
-    const files = Object.keys(byFile)
+    prevSigs = curSigs
 
-    const fixTasks = files.length > FIX_BATCH_FILE_THRESHOLD
-      ? files.map(function(file) {
-          return function() {
+    if (!pEscalateToDebug) {
+      // GH-132: batch into ONE agent covering every file this round unless the round's blocking
+      // findings span more files than FIX_BATCH_FILE_THRESHOLD — past that, fall back to the
+      // original one-agent-per-file parallel fan-out.
+      const byFile = {}
+      for (const f of blocking) {
+        if (!byFile[f.file]) byFile[f.file] = []
+        byFile[f.file].push(f)
+      }
+      const files = Object.keys(byFile)
+
+      const fixTasks = files.length > FIX_BATCH_FILE_THRESHOLD
+        ? files.map(function(file) {
+            return function() {
+              return callAgent(
+                'Fix findings in ' + file + ':\n\n' + JSON.stringify(byFile[file], null, 2) + '\n\n' +
+                'Enforce SI-1…SI-7. Run pytest -q after.',
+                { label: 'fix:phase:r' + pRound + ':' + file.replace(/\//g, '-'),
+                  phase: 'Phase Redteam', agentType: 'python-implementer' }
+              )
+            }
+          })
+        : [function() {
             return callAgent(
-              'Fix findings in ' + file + ':\n\n' + JSON.stringify(byFile[file], null, 2) + '\n\n' +
+              'Fix findings, grouped by file:\n\n' + JSON.stringify(byFile, null, 2) + '\n\n' +
               'Enforce SI-1…SI-7. Run pytest -q after.',
-              { label: 'fix:phase:r' + pRound + ':' + file.replace(/\//g, '-'),
-                phase: 'Phase Redteam', agentType: 'python-implementer' }
+              { label: 'fix:phase:r' + pRound, phase: 'Phase Redteam', agentType: 'python-implementer' }
             )
-          }
-        })
-      : [function() {
-          return callAgent(
-            'Fix findings, grouped by file:\n\n' + JSON.stringify(byFile, null, 2) + '\n\n' +
-            'Enforce SI-1…SI-7. Run pytest -q after.',
-            { label: 'fix:phase:r' + pRound, phase: 'Phase Redteam', agentType: 'python-implementer' }
-          )
-        }]
+          }]
 
-    await parallel(fixTasks)
-  }
+      await parallel(fixTasks)
+    }
 
-  // GH-19: consume gate result — red suite blocks loop continuation.
-  // RT-001: fail-closed — null gate response is unknown state, treated as failure.
-  const phaseGate = await callAgent(
-    'Run: python -m pytest -q\n' +
-    'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
-    '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
-    { schema: GATE_SCHEMA, label: 'gate:phase:r' + pRound, phase: 'Phase Redteam' }
-  )
-  if (!phaseGate) {
-    log('WARNING: phase gate agent returned null at round ' + pRound + ' — treating as gate failure (unknown state)')
-    testsRed = true
-    // WC-003: write a deferred note so the operator has a durable artifact indicating
-    // which round's gate failed and how to retry. Mirrors the unit loop null-gate path.
-    await callAgent(
-      'Write workspace/todos/deferred/' + wave.waveId + '-phase-gate-null-r' + pRound + '.md\n\n' +
-      'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
-      'round (' + pRound + '), reason: phase gate agent returned null (unknown test state).\n' +
-      'Instruction: "Re-run /wave ' + wave.waveId + ' to retry phase gate."',
-      { label: 'defer:phase:gate-null:r' + pRound, phase: 'Phase Redteam' }
-    )
-    // RT-002: null gate blocks loop continuation — do not silently proceed.
-    break
-  }
-  if (phaseGate.exitCode !== 0) {
-    testsRed = true
-    log('Gate RED (' + phaseGate.failCount + ' failing) — dispatching test-fix agent')
-    await callAgent(
-      'Fix the failing tests below. Read the test file and the source it covers.\n' +
-      'Failing tests:\n' + phaseGate.failures.join('\n') + '\n\n' +
-      'Run `python -m pytest -q <failing-test-file>` to confirm GREEN before finishing.',
-      { label: 'fix:tests:phase:r' + pRound, phase: 'Phase Redteam' }
-    )
-    // RT-002: re-gate after test-fix to verify the fix succeeded before continuing the loop.
-    const phaseReGate = await callAgent(
+    // GH-19: consume gate result — red suite blocks loop continuation.
+    // RT-001: fail-closed — null gate response is unknown state, treated as failure.
+    const phaseGate = await callAgent(
       'Run: python -m pytest -q\n' +
       'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
       '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
-      { schema: GATE_SCHEMA, label: 'gate:phase:r' + pRound + ':recheck', phase: 'Phase Redteam' }
+      { schema: GATE_SCHEMA, label: 'gate:phase:r' + pRound, phase: 'Phase Redteam' }
     )
-    // RT-001: fail-closed — null re-gate is still unknown, treat as red and stop the loop.
-    if (!phaseReGate || phaseReGate.exitCode !== 0) {
-      const failCount = phaseReGate ? phaseReGate.failCount : '?'
-      log('Re-gate still RED (' + failCount + ' failing) after test-fix — stopping phase redteam loop')
+    if (!phaseGate) {
+      log('WARNING: phase gate agent returned null at round ' + pRound + ' — treating as gate failure (unknown state)')
+      testsRed = true
+      // WC-003: write a deferred note so the operator has a durable artifact indicating
+      // which round's gate failed and how to retry. Mirrors the unit loop null-gate path.
       await callAgent(
-        'Write workspace/todos/deferred/' + wave.waveId + '-phase-tests-red-r' + pRound + '.md\n\n' +
+        'Write workspace/todos/deferred/' + wave.waveId + '-phase-gate-null-r' + pRound + '.md\n\n' +
         'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
-        'round (' + pRound + '), reason: test suite RED after fix attempt.\n' +
-        'Instruction: "Fix failing tests and re-run /wave ' + wave.waveId + '".',
-        { label: 'defer:phase:tests-red:r' + pRound, phase: 'Phase Redteam' }
+        'round (' + pRound + '), reason: phase gate agent returned null (unknown test state).\n' +
+        'Instruction: "Re-run /wave ' + wave.waveId + ' to retry phase gate."',
+        { label: 'defer:phase:gate-null:r' + pRound, phase: 'Phase Redteam' }
       )
+      // RT-002: null gate blocks loop continuation — do not silently proceed.
       break
+    }
+    if (phaseGate.exitCode !== 0) {
+      testsRed = true
+      log('Gate RED (' + phaseGate.failCount + ' failing) — dispatching test-fix agent')
+      await callAgent(
+        'Fix the failing tests below. Read the test file and the source it covers.\n' +
+        'Failing tests:\n' + phaseGate.failures.join('\n') + '\n\n' +
+        'Run `python -m pytest -q <failing-test-file>` to confirm GREEN before finishing.',
+        { label: 'fix:tests:phase:r' + pRound, phase: 'Phase Redteam' }
+      )
+      // RT-002: re-gate after test-fix to verify the fix succeeded before continuing the loop.
+      const phaseReGate = await callAgent(
+        'Run: python -m pytest -q\n' +
+        'Report: exitCode (0=pass, non-zero=fail), passCount, failCount, and failures (list of\n' +
+        '"test_file.py::test_name: reason" strings for each failing test). Return all fields.',
+        { schema: GATE_SCHEMA, label: 'gate:phase:r' + pRound + ':recheck', phase: 'Phase Redteam' }
+      )
+      // RT-001: fail-closed — null re-gate is still unknown, treat as red and stop the loop.
+      if (!phaseReGate || phaseReGate.exitCode !== 0) {
+        const failCount = phaseReGate ? phaseReGate.failCount : '?'
+        log('Re-gate still RED (' + failCount + ' failing) after test-fix — stopping phase redteam loop')
+        await callAgent(
+          'Write workspace/todos/deferred/' + wave.waveId + '-phase-tests-red-r' + pRound + '.md\n\n' +
+          'Include: wave ID (' + wave.waveId + '), date (' + TODAY + '),\n' +
+          'round (' + pRound + '), reason: test suite RED after fix attempt.\n' +
+          'Instruction: "Fix failing tests and re-run /wave ' + wave.waveId + '".',
+          { label: 'defer:phase:tests-red:r' + pRound, phase: 'Phase Redteam' }
+        )
+        break
+      }
     }
   }
 }
@@ -1638,7 +1841,7 @@ if (!runProtocol) {
   if (runA2UI) {
     advisorTasks.push(function() {
       return callAgent(
-        'A2UI v0.9.1 + Standard Profile v1 conformance audit.\n\n' +
+        'A2UI v0.9.1 + Standard Profile v1.1 conformance audit.\n\n' +
         'Files to audit:\n' +
         wave.allScope.filter(function(p) {
           return A2UI_SURFACE.some(function(pp) { return p.indexOf(pp) !== -1 })
@@ -1998,31 +2201,55 @@ if (toCodeify.length > 0) {
 }
 
 if (lrnCandidates.length > 0) {
-  await parallel(lrnCandidates.map(function(f, i) {
+  // LRN writes are batched ~LRN_BATCH_SIZE findings per codify agent (one dispatch writes
+  // N files) instead of one agent per finding — each agent pays full spin-up to write one
+  // small file, so a wide per-finding fan-out is mostly overhead. Numbering is unchanged:
+  // every finding carries lrnBase + its ORIGINAL index in lrnCandidates, computed before
+  // batching, so an ID never depends on batch position. Batches still run concurrently.
+  const LRN_BATCH_SIZE = 5
+  const lrnAssignments = lrnCandidates.map(function(f, i) {
+    const lrnNum = lrnBase + i
+    return { lrnId: 'LRN-' + String(lrnNum).padStart(3, '0'), finding: f }
+  })
+  const lrnBatches = []
+  for (let start = 0; start < lrnAssignments.length; start += LRN_BATCH_SIZE) {
+    lrnBatches.push(lrnAssignments.slice(start, start + LRN_BATCH_SIZE))
+  }
+  log('Writing ' + lrnAssignments.length + ' LRN file(s) in ' + lrnBatches.length + ' batch(es) of up to ' + LRN_BATCH_SIZE)
+
+  await parallel(lrnBatches.map(function(batch) {
     return function() {
-      const lrnNum = lrnBase + i
-      const lrnId  = 'LRN-' + String(lrnNum).padStart(3, '0')
+      const ids = batch.map(function(a) { return a.lrnId })
+      const entries = batch.map(function(a, k) {
+        const f     = a.finding
+        const lrnId = a.lrnId
+        return '### Learning file ' + (k + 1) + ' of ' + batch.length + ' — ' + lrnId + '\n' +
+          'Assigned ID: ' + lrnId + '\n' +
+          'File path: workspace/learning/' + lrnId + '-<slug>.md\n' +
+          'Slug: 2-4 kebab-case words for the bug CLASS (not this instance).\n\n' +
+          'Finding:\n' + JSON.stringify(f, null, 2) + '\n\n' +
+          'Format (frontmatter mandatory):\n' +
+          '---\n' +
+          'id: ' + lrnId + '\n' +
+          'title: <short title>\n' +
+          'category: security | protocol | sdk | testing | ops\n' +
+          'severity: ' + f.severity + '\n' +
+          'source: ' + (f.file === 'protocol-surface' ? 'protocol-audit' : 'redteam') + '\n' +
+          'date: ' + TODAY + '\n' +
+          '---\n\n' +
+          '## What happened\n<2-3 sentences from the finding>\n\n' +
+          '## Root cause\n<1-2 sentences>\n\n' +
+          '## Check\n<specific grep or test to verify>\n\n' +
+          '## Prevention\n<actionable planner constraint>\n\n' +
+          'Keep the file under 1KB.'
+      }).join('\n\n')
       return callAgent(
-        'Write a learning file. Do NOT touch workspace/learning/README.md yet.\n\n' +
-        'Assigned ID: ' + lrnId + '\n' +
-        'File path: workspace/learning/' + lrnId + '-<slug>.md\n' +
-        'Slug: 2-4 kebab-case words for the bug CLASS (not this instance).\n\n' +
-        'Finding:\n' + JSON.stringify(f, null, 2) + '\n\n' +
-        'Format (frontmatter mandatory):\n' +
-        '---\n' +
-        'id: ' + lrnId + '\n' +
-        'title: <short title>\n' +
-        'category: security | protocol | sdk | testing | ops\n' +
-        'severity: ' + f.severity + '\n' +
-        'source: ' + (f.file === 'protocol-surface' ? 'protocol-audit' : 'redteam') + '\n' +
-        'date: ' + TODAY + '\n' +
-        '---\n\n' +
-        '## What happened\n<2-3 sentences from the finding>\n\n' +
-        '## Root cause\n<1-2 sentences>\n\n' +
-        '## Check\n<specific grep or test to verify>\n\n' +
-        '## Prevention\n<actionable planner constraint>\n\n' +
-        'Keep the file under 1KB.',
-        { label: 'codify:' + lrnId, phase: 'Codify', agentType: 'codify' }
+        'Write ' + batch.length + ' learning file(s) — one file per entry below, each with its own\n' +
+        'Write call, using exactly the Assigned ID and File path given for that entry.\n' +
+        'Do NOT touch workspace/learning/README.md yet.\n\n' +
+        entries,
+        { label: 'codify:' + ids[0] + (ids.length > 1 ? '..' + ids[ids.length - 1] : ''),
+          phase: 'Codify', agentType: 'codify' }
       )
     }
   }))
