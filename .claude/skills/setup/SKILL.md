@@ -91,6 +91,10 @@ Collect, then echo back a summary for confirmation before touching any file:
         `AGENT_SDK_OAUTH_IDP_ISSUER=https://login.microsoftonline.com/<TENANT_GUID>/v2.0`,
         `AGENT_SDK_OAUTH_IDP_CLIENT_ID=<CLIENT_ID>`. Install the `agent-sdk[oidc]`
         extra. Do not set `AGENT_SDK_OAUTH_ONE_TIME_CONSENT` with it.
+     Non-Entra issuer: boot refuses unless `AGENT_SDK_OAUTH_IDP_REQUIRED_ROLE` or
+     `AGENT_SDK_OAUTH_IDP_REQUIRED_GROUP` is set, or you set
+     `AGENT_SDK_OAUTH_IDP_ALLOW_ALL_ISSUER_USERS=true` (admits every account at
+     the issuer; logs a warning; only valid with `AGENT_SDK_OAUTH_IDP=oidc`).
      Note: a removed user keeps access until their session ends (default 30 days,
      `AGENT_SDK_OAUTH_IDP_SESSION_HOURS`).
 5. **Model backend** — Bedrock (default) or another `ModelClient`. Collect the
