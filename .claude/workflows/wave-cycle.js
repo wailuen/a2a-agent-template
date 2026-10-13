@@ -130,8 +130,8 @@ const WAVE_SCHEMA = {
   additionalProperties: false,
   properties: {
     waveId:      { type: 'string' },
-    allCreates:  { type: 'array', items: { type: 'string' }, description: 'RT-001 (fix round): every backticked path token a todo creates. A bare-path Creates: line is the MINORITY form in this repo\'s todos — the DOMINANT form declares every real path inside prose with no separate Modifies: field at all, e.g. `Creates: (modifies `a`, `b`, `c`); adds `x``, where `a`/`b`/`c` are modifies (see allModifies) and `x` alone is the create. Extraction must scan the whole Creates: line for every backticked token, not stop at the first one.' },
-    allModifies: { type: 'array', items: { type: 'string' }, description: 'RT-001 (fix round): every backticked path token a todo modifies — both a dedicated Modifies: line AND every backticked token named inside a "modifies ..." clause (parenthetical or bare) on a Creates: line, which is how most of this repo\'s todos declare their real modify-set.' },
+    allCreates:  { type: 'array', items: { type: 'string' }, description: 'RT-001 (fix round): every path token (backticked OR bare) a todo creates. A bare-path Creates: line is the MINORITY form in this repo\'s own todos but the ONLY form the planner agent writes for agent repos (RT-001 fresh-lens debug) — the DOMINANT form declares every real path inside prose with no separate Modifies: field at all, e.g. `Creates: (modifies `a`, `b`, `c`); adds `x``, where `a`/`b`/`c` are modifies (see allModifies) and `x` alone is the create. Extraction must scan the whole Creates: line for every path token, backticked or bare, not stop at the first one.' },
+    allModifies: { type: 'array', items: { type: 'string' }, description: 'RT-001 (fix round): every path token (backticked OR bare) a todo modifies — both a dedicated Modifies: line AND every token named inside a "modifies ..." clause (parenthetical or bare) on a Creates: line, which is how most of this repo\'s todos declare their real modify-set.' },
     lrnNext:     { type: 'integer' },
     completedFileExists: { type: 'boolean', description: 'RT-004: true if workspace/todos/completed/<basename of the wave file> already exists (`test -f workspace/todos/completed/<basename> && echo yes || echo no`), determined UNCONDITIONALLY while parsing — a reused wave ID whose basename collides with an already-archived wave would have its record silently overwritten by the archive step\'s mv-by-basename (and, for wave-cycle.js, the LRN-100 deferred-marker relocation sweep)' },
     groupDeps: {
@@ -729,7 +729,14 @@ const wave = await callAgent(
   '(e.g. LRN-023 → lrnNext = 24; if none, lrnNext = 1).\n\n' +
   'Extract:\n' +
   '- waveId: the w[NNN] identifier from the filename\n' +
-  '- A "path token" is a backticked token that names exactly ONE FILE. RT-001\n' +
+  '- A "path token" is any token on a Creates:/Modifies: line that names exactly ONE\n' +
+  '  FILE, backticked OR BARE (RT-001, fresh-lens debug): the planner agent writes bare,\n' +
+  '  comma-separated paths (e.g. Creates: src/tools/x.py, tests/test_x.py) and bare\n' +
+  '  "(modifies a, b)" clauses, so a path is NEVER skipped for lacking backticks. Split\n' +
+  '  the line on whitespace, commas, semicolons, parens and square brackets; strip\n' +
+  '  backticks, "*" and quotes from both ends of each piece and any trailing . , : ;\n' +
+  '  then apply the rules below. A bold **Creates:** / **Modifies:** header line counts\n' +
+  '  too, and a trailing "# ..." annotation is still part of its line. RT-001\n' +
   '  (round-7 fresh-lens debug): these lines are PROSE, so they also backtick things\n' +
   '  that are NOT scope. REJECT every one of the following outright: a DIRECTORY (any\n' +
   '  token ending in "/" — `agent_sdk/`, `docs/`, `.claude/agents/`, `harness/skills/`),\n' +
@@ -756,19 +763,19 @@ const wave = await callAgent(
   '  can never string-match the real, directory-qualified dirty path `git status`\n' +
   '  reports for it and must be REJECTED; write the full path instead. This rule is\n' +
   '  the prose twin of harness/wave_scope.py::_looks_like_path; keep the two in step.\n' +
-  '- allCreates: every backticked repo-relative path token this wave creates. RT-001\n' +
+  '- allCreates: every repo-relative path token (backticked or bare) this wave creates. RT-001\n' +
   '  (fix round): a "Creates:" line is NOT always a bare path — this repo\'s dominant\n' +
   '  todo form puts every real deliverable inside prose with NO separate "Modifies:"\n' +
   '  field at all, e.g. a todo line reading: Creates: (modifies `a`, `b`, `c`); adds\n' +
-  '  `d`, `e`. Scan the FULL "Creates:" line for EVERY backticked path token, wherever\n' +
+  '  `d`, `e`. Scan the FULL "Creates:" line for EVERY path token (backticked or bare), wherever\n' +
   '  it sits — inside a parenthetical "(modifies ...)" clause, after a trailing "adds\n' +
   '  ..." / "adds/updates ..." clause, or bare. NEVER stop at the first backticked\n' +
   '  token on the line: a Creates: line naming six modified files inside one\n' +
   '  parenthetical, followed by a trailing "adds `x`" clause, has SEVEN real paths, not\n' +
   '  one. A path token belongs in allCreates UNLESS it sits inside a "modifies ..."\n' +
   '  clause (parenthetical or bare) naming it — those belong in allModifies instead.\n' +
-  '- allModifies: every backticked repo-relative path token this wave modifies. This\n' +
-  '  includes BOTH a dedicated "Modifies:" line\'s paths AND every backticked path\n' +
+  '- allModifies: every repo-relative path token (backticked or bare) this wave modifies. This\n' +
+  '  includes BOTH a dedicated "Modifies:" line\'s paths AND every (backticked or bare) path\n' +
   '  token named inside a "modifies ..." clause on a Creates: line, parenthetical or\n' +
   '  bare — e.g. Creates: (modifies `a`); modifies `b` names TWO modifies, not one. Do\n' +
   '  NOT assume a todo\'s real modify-set appears only on its own "Modifies:" line: most\n' +
@@ -833,7 +840,9 @@ for (const g of wave.groups) {
 // could silently drop a path such as `src/config.py`. Run a plain regex scan of every
 // Creates:/Modifies: line (through the same agent-call channel used for the file read), union it
 // with the AI result, and fail Parse if the AI missed anything the scan found. Fail-closed: a
-// null scan response is unknown state, not "nothing found".
+// null scan response is unknown state, not "nothing found". RT-001 (w047 fresh-lens debug): the
+// scan reads BARE paths as well as backticked ones (the planner agent writes bare comma-separated
+// paths); a backtick-only scan printed [] for every planner-format wave, making this gate a no-op.
 const scopeScan = await callAgent(
   'Run this script exactly as written (do not edit it) and return the JSON list it prints as ' +
   '`paths`, unmodified. It is a deterministic regex scan of the Creates:/Modifies: lines of the ' +
@@ -854,8 +863,10 @@ const scopeScan = await callAgent(
   'out=[]; skip=False\n' +
   'for l in open(sys.argv[1],encoding="utf-8"):\n' +
   '    if re.match(r"\\s*(?:[-*]\\s*)?(?:#{1,6}\\s|\\[.\\])",l): skip="[~]" in l\n' +
-  '    if skip or not re.match(r"\\s*(?:[-*]\\s*)?(?:Creates|Modifies):",l,re.I): continue\n' +
-  '    out+=[m for m in re.findall(r"`([^`]+)`",l) if ok(m)]\n' +
+  '    if skip or not re.match(r"\\s*(?:[-*+]\\s*)?(?:\\*\\*)?(?:Creates|Modifies)(?:\\*\\*)?:",l,re.I): continue\n' +
+  '    for t in re.split(r"[\\s,;()\\[\\]]+",l):\n' +
+  '        t=t.lstrip("`*"+chr(34)+chr(39)).rstrip("`*.,:;"+chr(34)+chr(39))\n' +
+  '        if ok(t): out.append(t)\n' +
   'print(json.dumps(sorted(set(out))))\n' +
   'PY',
   { schema: SCOPE_SCAN_SCHEMA, label: 'parse:scope-scan', phase: 'Parse' }
@@ -2443,6 +2454,12 @@ if (!protocolBlocked) {
     '   `template/` + that path (e.g. template/.claude/workflows/wave-cycle.js) to\n' +
     '   offendingHarnessPaths. This is the only way this gate can see an uncommitted\n' +
     '   template mirror — the mirror lives in a repo the top-level git status cannot see.\n' +
+    '   RT-001 (w047 round-5 debug): a COMMITTED but UNPUSHED mirror is just as unsynced —\n' +
+    '   agent repos pull the template from origin, not this working tree. Also run:\n' +
+    '   git -C template rev-list --count @{upstream}..HEAD\n' +
+    '   If it prints anything other than 0 (or fails, e.g. no upstream), add\n' +
+    '   template/.claude/workflows/wave-cycle.js to offendingHarnessPaths with the note\n' +
+    '   "template/ has unpushed commits: run git -C template push".\n' +
     '5. GH-118 import cross-check (LRN-119 — mid-wave module extraction). RT-001: this step\n' +
     '   MUST resolve RELATIVE intra-package imports (`from . import X`, `from .mod import Y`,\n' +
     '   `from ..pkg.mod import Z`) in addition to ABSOLUTE `src.*` imports (`src` is THIS\n' +
