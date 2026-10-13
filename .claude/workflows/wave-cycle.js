@@ -660,6 +660,12 @@ let lastDispatchedLabel = 'none'
 let lastDispatchedPhase = 'Parse'
 let waveIdForBudgetNote = WAVE_FILE
 const _dispatchAgent = agent
+// RT-003: all agents share ONE working tree; a stash/reset by one silently deletes other
+// groups' uncommitted work (w043 lost GH-160/161/164 this way). Append the ban to every prompt.
+const SHARED_TREE_GIT_BAN =
+  '\n\nSHARED WORKING TREE RULE: other agents have uncommitted work in this tree. NEVER run\n' +
+  '`git stash`, `git reset`, `git checkout -- <path>`, `git restore`, `git clean` or\n' +
+  '`git checkout .`. Edit files in place. To inspect old content use `git show` / `git diff`.'
 async function callAgent(prompt, opts) {
   agentCallCount++
   if (agentCallCount > AGENT_CALL_BUDGET) {
@@ -689,7 +695,7 @@ async function callAgent(prompt, opts) {
   }
   lastDispatchedLabel = (opts && opts.label) || lastDispatchedLabel
   lastDispatchedPhase = (opts && opts.phase) || lastDispatchedPhase
-  return _dispatchAgent(prompt, opts)
+  return _dispatchAgent(prompt + SHARED_TREE_GIT_BAN, opts)
 }
 
 // ─── state ────────────────────────────────────────────────────────────────────
@@ -840,7 +846,7 @@ const scopeScan = await callAgent(
   'BAD=" ()"+chr(34)+chr(39)\n' +
   'def ok(t):\n' +
   '    if not t or any(c in t for c in BAD) or "*" in t or "?" in t: return False\n' +
-  '    if t.startswith("/") or t.endswith("/"): return False\n' +
+  '    if t.startswith("/") or t.endswith("/") or t.startswith("template/"): return False\n' +
   '    f=t.rsplit("/",1)[-1]\n' +
   '    if f.startswith("."): return f in DOT\n' +
   '    if "/" not in t: return "__" not in t and f.endswith(ROOT)\n' +
