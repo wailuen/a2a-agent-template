@@ -2728,7 +2728,7 @@ if (protocolBlocked) {
     '3. For each path in the scope list, find the matching FR in workspace/prd/ if any.\n' +
     '   If Implementation: says [pending], replace with the real src/path:symbol.\n' +
     '   If Test: says [pending], replace with `tests/<file>.py::<test_name>` ONLY for a test that exists and passed in this wave: ' +
-    'the file must be a tests/ path in the scope list below and the test name must be cited in ' + WAVE_FILE + ' and defined in that file. ' +
+    'the file must be a tests/ path in the scope list below and the test name must be cited in the wave file (now at workspace/todos/completed/' + WAVE_BASENAME + ' after step 1) and defined in that file. ' +
     'Otherwise leave Test: as [pending].\n' +
     '   Scope paths (Creates: ∪ Modifies:):\n' + wave.allScope.join('\n') + '\n\n' +
     '4. LRN-100 relocation sweep: for every `*-budget-exhausted.md` file in\n' +
