@@ -112,6 +112,18 @@ const A2UI_SURFACE = ['src/a2ui/', 'src/models/content_types']
 
 // ─── schemas ──────────────────────────────────────────────────────────────────
 
+// GH-164: the Parse-phase scope scan is deterministic (a regex run by the agent, not an AI
+// reading), so a path the AI parse drops (e.g. `src/config.py`) is caught instead of silently
+// narrowing every downstream gate keyed off wave.allScope.
+const SCOPE_SCAN_SCHEMA = {
+  type: 'object',
+  required: ['paths'],
+  additionalProperties: false,
+  properties: {
+    paths: { type: 'array', items: { type: 'string' }, description: 'GH-164: the exact paths printed by the scan script, unmodified' },
+  },
+}
+
 const WAVE_SCHEMA = {
   type: 'object',
   required: ['waveId', 'allCreates', 'allModifies', 'groups', 'groupDeps', 'lrnNext', 'completedFileExists'],
@@ -724,11 +736,16 @@ const wave = await callAgent(
   '  reads it as one, so a single directory token would declare an entire subtree and\n' +
   '  silently disable the undeclared-scope check. Accept a token only if its FINAL\n' +
   '  segment is a filename ending in a real repo extension (.py .js .ts .md .json .toml\n' +
-  '  .yaml .yml): `harness/wave_scope.py`, `pyproject.toml`, and\n' +
+  '  .yaml .yml .lock) or is EXACTLY one of these known lockfiles/dotfiles (GH-164):\n' +
+  '  `uv.lock`, `package-lock.json`, `poetry.lock`, `yarn.lock`, `pnpm-lock.yaml`,\n' +
+  '  `.env.example`, `.env.sample`, `.env.template`, `.gitignore`, `.gitattributes`,\n' +
+  '  `.dockerignore`, `.editorconfig`, `.python-version`, `.nvmrc`, `.npmrc`,\n' +
+  '  `.pre-commit-config.yaml` (any other leading-dot name, like a bare `.py` or `.env`,\n' +
+  '  is still rejected). Qualifying examples: `harness/wave_scope.py`, `pyproject.toml`, and\n' +
   '  `.claude/workflows/wave-cycle.js` all qualify (a leading dot-segment is fine — the\n' +
   '  FINAL segment is what must look like a filename). RT-001 (residual fix): a token\n' +
   '  with NO "/" at all is further restricted to ROOT-LEVEL extensions (.md .json\n' +
-  '  .toml .yaml .yml) — no .py/.js/.ts source file is ever bare at this repo\'s root,\n' +
+  '  .toml .yaml .yml .lock, plus the known dotfiles above) — no .py/.js/.ts source file is ever bare at this repo\'s root,\n' +
   '  every real one is nested, so a bare `wave-cycle.js` or `test_workflow_sync.py`\n' +
   '  can never string-match the real, directory-qualified dirty path `git status`\n' +
   '  reports for it and must be REJECTED; write the full path instead. This rule is\n' +
@@ -805,6 +822,52 @@ for (const g of wave.groups) {
   g.modifies = uniq(g.modifies)
   g.scope    = uniq(g.creates.concat(g.modifies))
 }
+
+// GH-164 (A): allScope came only from the AI parse above, with no deterministic check, so it
+// could silently drop a path such as `src/config.py`. Run a plain regex scan of every
+// Creates:/Modifies: line (through the same agent-call channel used for the file read), union it
+// with the AI result, and fail Parse if the AI missed anything the scan found. Fail-closed: a
+// null scan response is unknown state, not "nothing found".
+const scopeScan = await callAgent(
+  'Run this script exactly as written (do not edit it) and return the JSON list it prints as ' +
+  '`paths`, unmodified. It is a deterministic regex scan of the Creates:/Modifies: lines of the ' +
+  'wave file; do not add, remove or reinterpret any path.\n\n' +
+  'python3 - ' + WAVE_FILE + ' <<\'PY\'\n' +
+  'import json,re,sys\n' +
+  'EXT=(".py",".js",".ts",".md",".json",".toml",".yaml",".yml",".lock")\n' +
+  'ROOT=(".md",".json",".toml",".yaml",".yml",".lock")\n' +
+  'DOT={".env.example",".env.sample",".env.template",".gitignore",".gitattributes",".dockerignore",".editorconfig",".python-version",".nvmrc",".npmrc",".pre-commit-config.yaml"}\n' +
+  'BAD=" ()"+chr(34)+chr(39)\n' +
+  'def ok(t):\n' +
+  '    if not t or any(c in t for c in BAD) or "*" in t or "?" in t: return False\n' +
+  '    if t.startswith("/") or t.endswith("/"): return False\n' +
+  '    f=t.rsplit("/",1)[-1]\n' +
+  '    if f.startswith("."): return f in DOT\n' +
+  '    if "/" not in t: return "__" not in t and f.endswith(ROOT)\n' +
+  '    return f.endswith(EXT)\n' +
+  'out=[]; skip=False\n' +
+  'for l in open(sys.argv[1],encoding="utf-8"):\n' +
+  '    if re.match(r"\\s*(?:[-*]\\s*)?(?:#{1,6}\\s|\\[.\\])",l): skip="[~]" in l\n' +
+  '    if skip or not re.match(r"\\s*(?:[-*]\\s*)?(?:Creates|Modifies):",l,re.I): continue\n' +
+  '    out+=[m for m in re.findall(r"`([^`]+)`",l) if ok(m)]\n' +
+  'print(json.dumps(sorted(set(out))))\n' +
+  'PY',
+  { schema: SCOPE_SCAN_SCHEMA, label: 'parse:scope-scan', phase: 'Parse' }
+)
+if (!scopeScan || !Array.isArray(scopeScan.paths)) {
+  log('ERROR: wave ' + wave.waveId + ' deterministic scope scan returned no result — aborting Parse')
+  return { error: 'scope-scan-failed', waveId: wave.waveId }
+}
+const scannedScope = uniq(scopeScan.paths)
+const scopeMissedByParse = scannedScope.filter(function (p) { return wave.allScope.indexOf(p) === -1 })
+if (scopeMissedByParse.length > 0) {
+  log('ERROR: wave ' + wave.waveId + ' Parse missed ' + scopeMissedByParse.length + ' path(s) the ' +
+      'deterministic Creates:/Modifies: scan found: ' + scopeMissedByParse.join(', ') +
+      ' — aborting rather than running with a narrowed scope. Fix the wave file wording or re-run.')
+  return { error: 'scope-scan-mismatch', waveId: wave.waveId, missed: scopeMissedByParse }
+}
+wave.allScope = uniq(wave.allScope.concat(scannedScope))
+log('allScope (final, ' + wave.allScope.length + '): ' + wave.allScope.join(', '))
 
 // RT-006 (AGENT_CALL_BUDGET recompute): now that wave.groups.length is known, widen the hard
 // backstop to track the wave's own shape rather than the flat constant used for the handful of
