@@ -9,7 +9,7 @@ export const meta = {
     { title: 'Phase Redteam',  detail: 'Full-wave zero-tolerance fix loop (max 8 rounds; debug fires unconditionally at round 4+ (pRound > 3) and at any round when stall is detected (same findings as previous round); round 8 exits)' },
     { title: 'Protocol Audit', detail: 'A2A/MCP/AG-UI/A2UI conformance — parallel advisors + seam check (protocol-surface waves only)' },
     { title: 'Codify',         detail: 'SDK issue scan (sequential) → parallel LRN capture for critical/high findings → README index update → sequential C-NNN registration for new component candidates' },
-    { title: 'Archive',        detail: 'Move wave file to completed/, update plan.md, backfill FR Implementation: fields' },
+    { title: 'Archive',        detail: 'Move wave file to completed/, update plan.md, backfill FR Implementation: and Test: fields' },
   ],
 }
 
@@ -2704,6 +2704,9 @@ if (protocolBlocked) {
     '     Adjust the Slices column if you can determine the count from the file.\n\n' +
     '3. For each path in the scope list, find the matching FR in workspace/prd/ if any.\n' +
     '   If Implementation: says [pending], replace with the real src/path:symbol.\n' +
+    '   If Test: says [pending], replace with `tests/<file>.py::<test_name>` ONLY for a test that exists and passed in this wave: ' +
+    'the file must be a tests/ path in the scope list below and the test name must be cited in ' + WAVE_FILE + ' and defined in that file. ' +
+    'Otherwise leave Test: as [pending].\n' +
     '   Scope paths (Creates: ∪ Modifies:):\n' + wave.allScope.join('\n') + '\n\n' +
     '4. LRN-100 relocation sweep: for every `*-budget-exhausted.md` file in\n' +
     '   `workspace/todos/deferred/` (including this wave\'s own, if any), check whether\n' +
