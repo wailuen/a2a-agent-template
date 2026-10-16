@@ -70,13 +70,13 @@ not return until all scenarios pass or the round budget is exhausted.
    an SDK older than v0.15.0 it ignores `service` and mints an ordinary key; the
    parser then revokes that key and stops with "this SDK does not support service
    keys; upgrade to v0.15.0+". On success it writes the key to `SERVICE_KEY_FILE`
-   (mode 600, set before writing) and prints only the `key_id`.
+   (a fresh `mktemp` file, mode 600, checked before writing) and prints only the `key_id` and that file path (the path is not secret).
 
    ```bash
    export BASE_URL="<base_url>" KEY_LABEL="acceptance-<run-id>"
-   export SERVICE_KEY_FILE="/tmp/acc-key-<run-id>.txt"
+   export SERVICE_KEY_FILE="$(mktemp "${TMPDIR:-/tmp}/acc-key-XXXXXX")"
    export ADMIN_KEY="$(python3 -c 'import re,sys; m=re.search(r"^admin_key:\s*(\S+)", open(sys.argv[1]).read(), re.M); print(m.group(1) if m else "")' workspace/adr/ADR-000-<env>-credentials.md)"
-   (umask 077; : > "$SERVICE_KEY_FILE"; chmod 600 "$SERVICE_KEY_FILE"
+   (umask 077
    printf 'Authorization: Bearer %s\n' "$ADMIN_KEY" \
      | curl -s -X POST "$BASE_URL/admin/api/keys" -H @- -H "Content-Type: application/json" \
          -d "{\"label\":\"$KEY_LABEL\",\"service\":true}" \
@@ -95,15 +95,19 @@ not return until all scenarios pass or the round budget is exhausted.
                           input="Authorization: Bearer " + os.environ["ADMIN_KEY"] + "\n",
                           text=True, check=False)
        sys.exit("this SDK does not support service keys; upgrade to v0.15.0+")
-   fd = os.open(os.environ["SERVICE_KEY_FILE"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+   fd = os.open(os.environ["SERVICE_KEY_FILE"], os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+   st = os.fstat(fd)
+   if st.st_uid != os.getuid() or (st.st_mode & 0o777) != 0o600:
+       os.close(fd)
+       sys.exit("service key file is not private; refusing to write")
    with os.fdopen(fd, "w") as f:
        f.write(d["plaintext"])
-   print(d["key_id"])
+   print(d["key_id"], os.environ["SERVICE_KEY_FILE"])
    ')
    ```
 
-   Keep that printed `key_id` as `<service_key_id>`. The key itself lives only
-   in `SERVICE_KEY_FILE` (`<service_key_file>`); never print it. Do not pass the
+   Keep the printed `key_id` as `<service_key_id>` and the printed path as
+   `<service_key_file>`. The key itself lives only in that file; never print it. Do not pass the
    admin key to sub-agents.
 
 3. **Confirm server is alive.**
@@ -296,8 +300,13 @@ and an incremented `runId`.
 ### Workflow invocation
 
 ```
-// Using scriptPath instead of name: Workflow({name}) drops args in Claude Code's
-// named-workflow resolver; remove once upstream bug is fixed.
+// Using scriptPath instead of name: Workflow({name}) drops args in Claude Code's named-workflow resolver; remove once upstream bug is fixed.
+// Path note: when running from the SDK repo (the normal context for /acceptance),
+// git rev-parse --show-toplevel gives the repo root regardless of CWD subdirectory.
+// When running from an agent repo (seeded via /new-agent or /upgrade), this skill
+// lives at .claude/skills/acceptance/SKILL.md and acceptance-api.js is seeded to
+// .claude/workflows/acceptance-api.js — use that path instead:
+//   scriptPath: `${require('child_process').execSync('git rev-parse --show-toplevel').toString().trim()}/.claude/workflows/acceptance-api.js`
 
 // Secret externalisation (GH-89 / SI-2): the workflow sandbox has no CommonJS
 // require(), so the key file must be written HERE (in the skill caller context)
@@ -651,7 +660,7 @@ Never revoke between fix-loop rounds or before Phase 2B.
 - **Never exit with open failures.** The fix loop runs until all scenarios pass
   or 5 rounds are exhausted. Partial success is not a success.
 - **No secrets in output.** The service key (minted in Phase 0) is written to
-  a chmod-600 temp file (`/tmp/acc-key-<random>.txt`) by the workflow before
+  a chmod-600 temp file (a `mktemp` path, `acc-key-XXXXXX`) by the workflow before
   sub-agents are spawned. Sub-agents receive the path to that file, not the key
   value itself. The key is therefore absent from the prompt strings that appear
   in harness transcripts. Never print or log the resolved key value to the
