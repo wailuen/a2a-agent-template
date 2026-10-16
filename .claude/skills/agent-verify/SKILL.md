@@ -56,18 +56,42 @@ All subsequent `<port>` references in this skill use this resolved value.
 2. Wait for readiness: poll `GET /health` until 200 (fail fast if it never comes up;
    surface the boot error, not a timeout).
 3. Mint a throwaway admin API key from the bootstrap token for the authenticated
-   probes. Record `BASE=http://localhost:<port>`.
-4. Mint a **service key** with that admin key (GH-182). Set `BASE_URL=$BASE`,
-   `KEY_LABEL=agent-verify`, `SERVICE_KEY_FILE` (a throwaway path), and load
-   `ADMIN_KEY` into the environment without printing it. Run this ONE command
-   (GH-183/GH-184). The mint response never reaches stdout; a server older than
+   probes. Record `BASE=http://localhost:<port>`. Run this ONE command (Bash state
+   does not persist between calls). It reads the token from `$tmplog`, sends it
+   from stdin, writes the key to a mode-600 `ADMIN_KEY_FILE` and prints only
+   `key_id`; neither the token nor the key reaches the transcript:
+
+   ```bash
+   export BASE_URL="<BASE>" ADMIN_KEY_FILE="<throwaway admin key path>" TMPLOG="<tmplog>"
+   (umask 077; : > "$ADMIN_KEY_FILE"; chmod 600 "$ADMIN_KEY_FILE"
+   awk '/=== agent-sdk first-run bootstrap ===/{f=1;next} f&&NF{print "X-Bootstrap-Token: " $1;exit}' "$TMPLOG" \
+     | curl -s -X POST "$BASE_URL/admin/api/keys" -H @- -H "Content-Type: application/json" -d '{"label":"agent-verify-admin"}' \
+     | python3 -c '
+   import json, os, sys
+   try:
+       d = json.loads(sys.stdin.read())
+   except ValueError:
+       d = None
+   if not (isinstance(d, dict) and isinstance(d.get("plaintext"), str)):
+       sys.exit("admin key mint failed")
+   fd = os.open(os.environ["ADMIN_KEY_FILE"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+   with os.fdopen(fd, "w") as f:
+       f.write(d["plaintext"])
+   print(d["key_id"])
+   ')
+   ```
+
+4. Mint a **service key** with that admin key (GH-182). Run this ONE command
+   (GH-183/GH-184); it loads `ADMIN_KEY` from `ADMIN_KEY_FILE` itself. The mint
+   response never reaches stdout; a server older than
    v0.15.0 ignores `service`, so the parser revokes the stray key and stops with
    "this SDK does not support service keys; upgrade to v0.15.0+". On success the
    key is written to `SERVICE_KEY_FILE` (mode 600) and only `key_id` is printed:
 
    ```bash
-   # Needs env: BASE_URL, ADMIN_KEY (from the credentials file, never shown),
-   # SERVICE_KEY_FILE, KEY_LABEL. The response never reaches stdout.
+   export BASE_URL="<BASE>" KEY_LABEL="agent-verify"
+   export SERVICE_KEY_FILE="<throwaway service key path>" ADMIN_KEY_FILE="<throwaway admin key path>"
+   export ADMIN_KEY="$(cat "$ADMIN_KEY_FILE")"
    (umask 077; : > "$SERVICE_KEY_FILE"; chmod 600 "$SERVICE_KEY_FILE"
    printf 'Authorization: Bearer %s\n' "$ADMIN_KEY" \
      | curl -s -X POST "$BASE_URL/admin/api/keys" -H @- -H "Content-Type: application/json" \

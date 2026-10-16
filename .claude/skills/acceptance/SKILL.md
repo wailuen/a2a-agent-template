@@ -62,19 +62,20 @@ not return until all scenarios pass or the round budget is exhausted.
    and for teardown. Mint a non-admin service key and use it for every
    protocol call (A2A, AG-UI, MCP); a service key keeps working with
    `AGENT_SDK_OAUTH_IDP_DISABLE_API_KEYS=true` but cannot open `/admin`.
-   Set `BASE_URL=<base_url>`, `KEY_LABEL=acceptance-<run-id>`,
-   `SERVICE_KEY_FILE=/tmp/acc-key-<run-id>.txt`, and load `ADMIN_KEY` from
-   `admin_key` into the environment without printing it. Run this ONE command
-   (GH-183/GH-184). The mint response is piped into the parser and never reaches
-   the transcript. If the server is an SDK older than v0.15.0 it ignores
-   `service` and mints an ordinary key; the parser then revokes that key and
-   stops with "this SDK does not support service keys; upgrade to v0.15.0+".
-   On success it writes the key to `SERVICE_KEY_FILE` (mode 600, set before
-   writing) and prints only the `key_id`.
+   Run this ONE self-contained command (GH-183/GH-184). Bash state does not
+   persist between tool calls, so the command sets its own variables and loads
+   `ADMIN_KEY` from the ADR-000 file itself; never paste the admin key into the
+   command. Replace `<base_url>`, `<run-id>` and `<env>` first. The mint response
+   is piped into the parser and never reaches the transcript. If the server is
+   an SDK older than v0.15.0 it ignores `service` and mints an ordinary key; the
+   parser then revokes that key and stops with "this SDK does not support service
+   keys; upgrade to v0.15.0+". On success it writes the key to `SERVICE_KEY_FILE`
+   (mode 600, set before writing) and prints only the `key_id`.
 
    ```bash
-   # Needs env: BASE_URL, ADMIN_KEY (from the credentials file, never shown),
-   # SERVICE_KEY_FILE, KEY_LABEL. The response never reaches stdout.
+   export BASE_URL="<base_url>" KEY_LABEL="acceptance-<run-id>"
+   export SERVICE_KEY_FILE="/tmp/acc-key-<run-id>.txt"
+   export ADMIN_KEY="$(python3 -c 'import re,sys; m=re.search(r"^admin_key:\s*(\S+)", open(sys.argv[1]).read(), re.M); print(m.group(1) if m else "")' workspace/adr/ADR-000-<env>-credentials.md)"
    (umask 077; : > "$SERVICE_KEY_FILE"; chmod 600 "$SERVICE_KEY_FILE"
    printf 'Authorization: Bearer %s\n' "$ADMIN_KEY" \
      | curl -s -X POST "$BASE_URL/admin/api/keys" -H @- -H "Content-Type: application/json" \
@@ -317,8 +318,9 @@ Workflow({
   }
 })
 
-// Clean up the temp key file after the workflow returns.
-try { require('fs').unlinkSync(_keyFile) } catch (_e) { /* already gone — ignore */ }
+// Do NOT unlink _keyFile here: it is the only copy of the service key and is
+// reused by every Phase 3 re-run and Phase 2B. It is removed in the
+// 'Service key teardown' section.
 ```
 
 **Teardown:** do NOT revoke the service key here. It must stay valid for the
@@ -628,9 +630,17 @@ Next:  /acceptance --ux (if dual-path API just passed)
 
 ## Service key teardown (always, even on failure)
 
-Revoke the service key with the admin key only at the true exit points: after
-the final report, on Phase 3b escalation, and on any abort:
-`curl -sf -X DELETE <base_url>/admin/api/keys/<service_key_id> -H "Authorization: Bearer <admin_key>"`.
+Revoke the service key with the admin key, then delete the key file, only at
+the true exit points: after the final report, on Phase 3b escalation, and on any
+abort. Load `ADMIN_KEY` in the same command as the mint (never inline it):
+
+```bash
+export BASE_URL="<base_url>" SERVICE_KEY_ID="<service_key_id>" SERVICE_KEY_FILE="<service_key_file>"
+export ADMIN_KEY="$(python3 -c 'import re,sys; m=re.search(r"^admin_key:\s*(\S+)", open(sys.argv[1]).read(), re.M); print(m.group(1) if m else "")' workspace/adr/ADR-000-<env>-credentials.md)"
+printf 'Authorization: Bearer %s\n' "$ADMIN_KEY" | curl -s -o /dev/null -w '%{http_code}\n' -X DELETE "$BASE_URL/admin/api/keys/$SERVICE_KEY_ID" -H @-
+rm -f "$SERVICE_KEY_FILE"
+```
+
 Never revoke between fix-loop rounds or before Phase 2B.
 
 ## Rules
