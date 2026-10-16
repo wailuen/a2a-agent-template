@@ -61,14 +61,49 @@ not return until all scenarios pass or the round budget is exhausted.
    **Mint a service key (GH-182).** The admin key is used only for this step
    and for teardown. Mint a non-admin service key and use it for every
    protocol call (A2A, AG-UI, MCP); a service key keeps working with
-   `AGENT_SDK_OAUTH_IDP_DISABLE_API_KEYS=true` but cannot open `/admin`:
+   `AGENT_SDK_OAUTH_IDP_DISABLE_API_KEYS=true` but cannot open `/admin`.
+   Set `BASE_URL=<base_url>`, `KEY_LABEL=acceptance-<run-id>`,
+   `SERVICE_KEY_FILE=/tmp/acc-key-<run-id>.txt`, and load `ADMIN_KEY` from
+   `admin_key` into the environment without printing it. Run this ONE command
+   (GH-183/GH-184). The mint response is piped into the parser and never reaches
+   the transcript. If the server is an SDK older than v0.15.0 it ignores
+   `service` and mints an ordinary key; the parser then revokes that key and
+   stops with "this SDK does not support service keys; upgrade to v0.15.0+".
+   On success it writes the key to `SERVICE_KEY_FILE` (mode 600, set before
+   writing) and prints only the `key_id`.
+
    ```bash
-   curl -sf -X POST <base_url>/admin/api/keys \
-     -H "Authorization: Bearer <admin_key>" -H "Content-Type: application/json" \
-     -d '{"label":"acceptance-<run-id>","service":true}'
+   # Needs env: BASE_URL, ADMIN_KEY (from the credentials file, never shown),
+   # SERVICE_KEY_FILE, KEY_LABEL. The response never reaches stdout.
+   (umask 077; : > "$SERVICE_KEY_FILE"; chmod 600 "$SERVICE_KEY_FILE"
+   printf 'Authorization: Bearer %s\n' "$ADMIN_KEY" \
+     | curl -s -X POST "$BASE_URL/admin/api/keys" -H @- -H "Content-Type: application/json" \
+         -d "{\"label\":\"$KEY_LABEL\",\"service\":true}" \
+     | python3 -c '
+   import json, os, subprocess, sys
+   try:
+       d = json.loads(sys.stdin.read())
+   except ValueError:
+       d = None
+   ok = isinstance(d, dict) and d.get("service") is True and isinstance(d.get("plaintext"), str)
+   if not ok:
+       kid = d.get("key_id") if isinstance(d, dict) else None
+       if isinstance(kid, str) and kid:
+           subprocess.run(["curl", "-s", "-o", "/dev/null", "-X", "DELETE",
+                           os.environ["BASE_URL"] + "/admin/api/keys/" + kid, "-H", "@-"],
+                          input="Authorization: Bearer " + os.environ["ADMIN_KEY"] + "\n",
+                          text=True, check=False)
+       sys.exit("this SDK does not support service keys; upgrade to v0.15.0+")
+   fd = os.open(os.environ["SERVICE_KEY_FILE"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+   with os.fdopen(fd, "w") as f:
+       f.write(d["plaintext"])
+   print(d["key_id"])
+   ')
    ```
-   Keep `plaintext` as `<service_key>` and `key_id` as `<service_key_id>`
-   (never print them). Do not pass the admin key to sub-agents.
+
+   Keep that printed `key_id` as `<service_key_id>`. The key itself lives only
+   in `SERVICE_KEY_FILE` (`<service_key_file>`); never print it. Do not pass the
+   admin key to sub-agents.
 
 3. **Confirm server is alive.**
    ```bash
@@ -267,8 +302,7 @@ and an incremented `runId`.
 // require(), so the key file must be written HERE (in the skill caller context)
 // before Workflow() is invoked.  Pass only the file path; never pass the raw key.
 const _runId  = require('crypto').randomUUID()
-const _keyFile = `/tmp/acc-key-${_runId}.txt`
-require('fs').writeFileSync(_keyFile, <service_key>, { mode: 0o600 })
+const _keyFile = <service_key_file>  // created by the Phase 0 mint step with { mode: 0o600 }; do not rewrite it
 
 Workflow({
   scriptPath: `${require('child_process').execSync('git rev-parse --show-toplevel').toString().trim()}/.claude/workflows/acceptance-api.js`,

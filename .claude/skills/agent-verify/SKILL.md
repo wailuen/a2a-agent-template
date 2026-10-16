@@ -57,12 +57,48 @@ All subsequent `<port>` references in this skill use this resolved value.
    surface the boot error, not a timeout).
 3. Mint a throwaway admin API key from the bootstrap token for the authenticated
    probes. Record `BASE=http://localhost:<port>`.
-4. Mint a **service key** with that admin key (GH-182):
-   `POST /admin/api/keys` with `{"label":"agent-verify","service":true}`. Use
-   **only the service key** for every protocol call (A2A, AG-UI, MCP, the
-   `--live` umbrella); the admin key is kept for `/admin` probes and for
-   revoking the service key at teardown. A service key works with
-   `AGENT_SDK_OAUTH_IDP_DISABLE_API_KEYS=true` and is refused on `/admin`.
+4. Mint a **service key** with that admin key (GH-182). Set `BASE_URL=$BASE`,
+   `KEY_LABEL=agent-verify`, `SERVICE_KEY_FILE` (a throwaway path), and load
+   `ADMIN_KEY` into the environment without printing it. Run this ONE command
+   (GH-183/GH-184). The mint response never reaches stdout; a server older than
+   v0.15.0 ignores `service`, so the parser revokes the stray key and stops with
+   "this SDK does not support service keys; upgrade to v0.15.0+". On success the
+   key is written to `SERVICE_KEY_FILE` (mode 600) and only `key_id` is printed:
+
+   ```bash
+   # Needs env: BASE_URL, ADMIN_KEY (from the credentials file, never shown),
+   # SERVICE_KEY_FILE, KEY_LABEL. The response never reaches stdout.
+   (umask 077; : > "$SERVICE_KEY_FILE"; chmod 600 "$SERVICE_KEY_FILE"
+   printf 'Authorization: Bearer %s\n' "$ADMIN_KEY" \
+     | curl -s -X POST "$BASE_URL/admin/api/keys" -H @- -H "Content-Type: application/json" \
+         -d "{\"label\":\"$KEY_LABEL\",\"service\":true}" \
+     | python3 -c '
+   import json, os, subprocess, sys
+   try:
+       d = json.loads(sys.stdin.read())
+   except ValueError:
+       d = None
+   ok = isinstance(d, dict) and d.get("service") is True and isinstance(d.get("plaintext"), str)
+   if not ok:
+       kid = d.get("key_id") if isinstance(d, dict) else None
+       if isinstance(kid, str) and kid:
+           subprocess.run(["curl", "-s", "-o", "/dev/null", "-X", "DELETE",
+                           os.environ["BASE_URL"] + "/admin/api/keys/" + kid, "-H", "@-"],
+                          input="Authorization: Bearer " + os.environ["ADMIN_KEY"] + "\n",
+                          text=True, check=False)
+       sys.exit("this SDK does not support service keys; upgrade to v0.15.0+")
+   fd = os.open(os.environ["SERVICE_KEY_FILE"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+   with os.fdopen(fd, "w") as f:
+       f.write(d["plaintext"])
+   print(d["key_id"])
+   ')
+   ```
+
+   Use **only the service key** (read from `SERVICE_KEY_FILE`) for every protocol
+   call (A2A, AG-UI, MCP, the `--live` umbrella); the admin key is kept for
+   `/admin` probes and for revoking the service key at teardown (by the printed
+   `key_id`). A service key works with `AGENT_SDK_OAUTH_IDP_DISABLE_API_KEYS=true`
+   and is refused on `/admin`.
 
 ## Phase 2 — Conformance umbrella (delegate, don't re-derive)
 
