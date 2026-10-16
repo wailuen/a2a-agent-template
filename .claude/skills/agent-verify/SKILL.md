@@ -64,7 +64,7 @@ All subsequent `<port>` references in this skill use this resolved value.
    ```bash
    export BASE_URL="<BASE>" ADMIN_KEY_FILE="<throwaway admin key path>" TMPLOG="<tmplog>"
    (umask 077; : > "$ADMIN_KEY_FILE"; chmod 600 "$ADMIN_KEY_FILE"
-   awk '/=== agent-sdk first-run bootstrap ===/{f=1;next} f&&NF{print "X-Bootstrap-Token: " $1;exit}' "$TMPLOG" \
+   awk '/=== agent-sdk first-run bootstrap ===/{f=1;next} f&&/^[[:space:]]+[A-Za-z0-9_-]{20,}[[:space:]]*$/{print "X-Bootstrap-Token: " $1;exit}' "$TMPLOG" \
      | curl -s -X POST "$BASE_URL/admin/api/keys" -H @- -H "Content-Type: application/json" -d '{"label":"agent-verify-admin"}' \
      | python3 -c '
    import json, os, sys
