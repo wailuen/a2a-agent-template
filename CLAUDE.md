@@ -29,11 +29,11 @@ No features the PRD doesn't mention. When in doubt, read the code.
 
 | Skill | When to use |
 |---|---|
-| `/provision` | First-time agent setup — installs deps, seeds workspace |
-| `/setup` | Assign port, set env vars |
-| `/todos` | Break work into a typed wave plan |
-| `/wave` | Execute one wave end-to-end (implement → redteam → protocol audit → archive) |
-| `/implement` | Implement a single todo with tests |
+| `/setup` | Run once in a fresh template clone — substitutes `{{placeholders}}`, generates `MASTER_KEY`, first run |
+| `/provision` | Zero-to-running — verify `.env`, boot, bootstrap token, seed credentials, health-check sources, live tool call |
+| `/todos` | Plan-only — generate and redteam the wave plan for review before `/wave` |
+| `/wave` | Primary entry point — no args: plan all waves from the PRD and execute each; `/wave w001`: run or resume one wave |
+| `/implement` | Execute todos unattended end-to-end, with redteam loops (no Workflow fan-out) |
 | `/redteam` | Adversarial review against spec (runs inside `/wave` automatically) |
 | `/agent-verify` | Boot agent + full-stack conformance + OAuth-chain probes |
 | `/acceptance` | Run JTBD scenario acceptance suite |
@@ -41,11 +41,11 @@ No features the PRD doesn't mention. When in doubt, read the code.
 | `/add-source` | Scaffold a new SourceAdapter |
 | `/add-artifact` | Migrate a hardcoded persona to `src/artifacts/system.md` |
 | `/upgrade` | Sync harness files to a new SDK version |
-| `/analyze` | Produce a gap analysis for a new capability |
+| `/analyze` | Create or update PRD and ADR docs in `workspace/` |
 | `/codify` | Capture a root cause as a permanent LRN |
 | `/debug` | Root-cause a failing test or tool error |
 | `/diagnose` | Triage unexpected agent behaviour |
-| `/migrate` | Cross-wave refactor planning |
+| `/migrate` | One-shot migration of an existing non-SDK agent onto agent-sdk |
 | `/scenario` | Draft a new JTBD acceptance scenario |
 | `/changelog` | Generate release notes for a version bump |
 | `/update-card-description` | Regenerate `AGENT_DESCRIPTION` in `.env` from current tool docstrings + skill descriptions — run before committing when tools/skills changed |
