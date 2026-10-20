@@ -34,8 +34,9 @@ Read every `src/skills/*.md` file. For each:
 
 ### 3 — Read current value
 
-Read `AGENT_DESCRIPTION` from `.env` (empty string if absent or blank).
-Show it to the developer alongside the incoming draft.
+Read only the `AGENT_DESCRIPTION` line from `.env` (`grep '^AGENT_DESCRIPTION=' .env`;
+empty string if absent or blank) — `.env` also holds `MASTER_KEY`, so never print
+the whole file. Show the value to the developer alongside the incoming draft.
 
 ### 4 — Draft the description
 
