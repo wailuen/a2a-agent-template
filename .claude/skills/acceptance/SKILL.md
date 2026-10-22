@@ -178,6 +178,56 @@ Update `workspace/scenarios/README.md` with one row per new file.
 
 ---
 
+## Phase 1.5 — MCP tools gate
+
+Runs after Phase 1 and before any model run (Phase 2A/2B). Requires
+`agent-sdk >=0.18.0` (`agent_sdk.testing.mcp`). It calls every tier-1 tool
+directly over MCP, so a broken tool fails here with its name instead of
+showing up as a judged conversation.
+
+**Samples.** The service key from Phase 0 cannot open `/admin` (so it cannot
+read `GET /admin/api/tools`), and `tools/list` does not carry `sample=`. Take
+each tier-1 tool's `sample=` from the `@tools.tool(...)` decorators already
+read in Phase 0 step 4 and write them to a JSON file (not secret):
+`{"tool_name": {"arg": "value"}, "other_tool": null}`. Use `null` when the
+tool has no `sample=`. Never fetch samples with the admin key, never put any
+key in `.env`, in argv, or in this file.
+
+**Run** (the key is read from `<service_key_file>`; there is no key argument):
+
+```bash
+python -m agent_sdk.testing.mcp --base-url <base_url> --key-file <service_key_file> \
+  --samples-file <samples.json> --expected-count <N tier-1 tools> \
+  [--allow-error <tool>]... [--opt-in <tool>]...
+```
+
+It does, in order:
+
+1. `initialize`, then `tools/list` (all pages). Fails when the tool count
+   differs from the registered tier-1 count, an input field has no
+   description, an `inputSchema` has `$ref` or `$defs`, or the list is over
+   the size budget (default 120000 bytes, `--size-budget`).
+2. One `tools/call` per tool with its `sample=` args, only when the tool is
+   read-only (`annotations.readOnlyHint == true`, i.e. `read_only=True`).
+   - `sample=None`: skipped with a warning (not a failure).
+   - Not read-only: skipped with a warning, even with a `sample=`, so a
+     sample never sends mail or writes a record on every run. Opt-in is off
+     by default; name a tool with `--opt-in <tool>` only when its sample is
+     safe to run every time.
+   - Interrupt (`isError: true` whose text ends with `MCP_INTERRUPT_SUFFIX`
+     from `agent_sdk.routes.mcp`): reported "needs user input, skipped" as a
+     warning; the gate goes on.
+   - Any other `isError: true` not on the allow-list (`--allow-error <tool>`,
+     use sparingly and record why): the gate stops at once. Stop acceptance
+     before any model run and report the tool name and its `sample=` args.
+
+Output names the tool and `sample=` args only. It never prints the
+Authorization header or the raw `tools/call` error body (SI-2, SI-6). Exit
+code 1 means stop; copy the `FAIL:` lines into the report and fix the tool
+before re-running.
+
+---
+
 ## Phase 2A — Dual-path API (A2A + AG-UI, default)
 
 Each scenario runs on **both** transports concurrently. A scenario passes only
