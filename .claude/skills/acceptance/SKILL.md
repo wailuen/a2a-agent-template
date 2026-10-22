@@ -256,7 +256,16 @@ include depends on the state of the prior task:
   { "message": { "role": "user", "messageId": "<new-uuid4-hex>", "contextId": "<context-id>", "parts": [ ... ] } }
   ```
 
-The harness Python script captures `contextId` from `kind:"task"` and
+**Turn helper (GH-210).** Scenario agents do not write their own scripts. Each turn runs
+`ACC_QUERY=... python -m agent_sdk.testing.turns --transport a2a|agui --base-url ... --key-file <keyFile> --run-key ...`
+(`agent_sdk >= 0.18.0`). The helper reads the key from the key file only, allows 3
+concurrent turns across all scenarios (file locks; `--slots N` to change), and retries
+HTTP 429, "too many requests" text, a failed task or an empty reply with exponential
+back-off inside a 540 s budget. AG-UI messages are restored after a failed attempt and
+A2A ids are saved only on success. If retries run out on rate limiting it returns
+`failureClass: "rate-limited"`.
+
+The helper captures `contextId` from `kind:"task"` and
 `kind:"status-update"` SSE events on turn 1, persists it to
 `/tmp/acc-{RUN_KEY}-a2a-ctx.txt`, and persists the last observed `state` to
 `/tmp/acc-{RUN_KEY}-a2a-state.txt`. On turns 2+, it reads both files to
@@ -423,6 +432,12 @@ BOTH transports with the same root cause):
 - Mark this scenario ESCALATED and exclude it from further rounds.
   (A persona-gap does NOT block other scenarios from reaching 100%.)
 
+**`rate-limited`** — the server throttled the turns (HTTP 429 / "too many requests")
+even after helper retries:
+- Infrastructure, not an agent defect. Never score these turns 1–2 and never spawn a fix.
+- Re-run the scenario later with fewer slots (`--slots 1`) or fewer parallel scenarios.
+  Does not count toward the 100% pass gate until re-run.
+
 **`upstream-issue`** — source adapter / credential failure:
 - Spawn a diagnose agent: read the source adapter + check health via
   `GET /admin/api/overview` (admin bearer) and read `adapters[].healthy` for
@@ -478,6 +493,7 @@ Recommended actions:
   persona-gap          → /analyze update prd → add FR → /wave → /acceptance
   code-bug             → /debug <scenario-id> rationale  → fix → /acceptance
   upstream-issue       → /diagnose source <name>
+  rate-limited         → re-run /acceptance --scenario <id> with fewer slots (no fix)
   bad-scenario         → /acceptance --scenario <id> --regenerate
 ```
 
