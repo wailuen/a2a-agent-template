@@ -159,6 +159,8 @@ Called with labels `rt:unit:*` and `rt:phase:*`. Return:
       "id": "RT-001",
       "severity": "critical",
       "file": "src/tools/fetch.py",
+      "line": 42,
+      "quote": "exact text of the offending line as it is in the file right now",
       "description": "one-sentence description",
       "fix": "what to change",
       "codify": "one-sentence lesson (required for critical/high)",
@@ -167,6 +169,12 @@ Called with labels `rt:unit:*` and `rt:phase:*`. Return:
   ]
 }
 ```
+
+Every finding MUST carry `line` (1-based) and `quote` (the exact current text of that
+line, copied from the file you just read). The runner runs `grep -F` for each quote before
+each fix round and drops findings whose quote is gone. An empty quote is never dropped, so
+it is also never dismissed as stale. Never re-raise a finding whose line no longer exists in
+the current file: re-read the file first and report only what is there now.
 
 ### Mode 2 — Todos redteam (`PLAN_RT_SCHEMA`)
 
@@ -216,6 +224,7 @@ runs `/sdk-issue-scan` to file them as GitHub issues.
 
 ### Critical
 - **[RT-001][SDK]** <title> — `file:line`
+  **Quote:** `<exact current text of that line>`
   <what's wrong, why it matters, how to fix>
   **Codify:** <one-sentence lesson for LRN>
 

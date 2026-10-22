@@ -134,12 +134,14 @@ const RT_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['id', 'severity', 'file', 'description', 'fix'],
+        required: ['id', 'severity', 'file', 'line', 'quote', 'description', 'fix'],
         additionalProperties: false,
         properties: {
           id:           { type: 'string' },
           severity:     { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
           file:         { type: 'string' },
+          line:         { type: 'integer' },
+          quote:        { type: 'string' },
           description:  { type: 'string' },
           fix:          { type: 'string' },
           codify:       { type: 'string' },
@@ -1038,6 +1040,60 @@ while (remainingGroups.length > 0) {
   for (const rg of readyGroups) completedGroups.add(rg.label)
 }
 
+// Stale-finding filter: a finding must quote the exact current source line it is about. One
+// deterministic script runs `grep -F` for each quote in its file; a quote that is gone means
+// the finding is about code that no longer exists. Fail closed: an empty quote, a missing or
+// unsafe path, a grep error, or an untrustworthy script result all KEEP the finding.
+const STALE_CHECK_PY = [
+  'import json, os, subprocess, sys',
+  'items = json.loads(sys.argv[1])',
+  'stale = []',
+  'for i, it in enumerate(items):',
+  '    f, q = it.get("file") or "", it.get("quote") or ""',
+  '    if not q.strip() or not f or os.path.isabs(f) or ".." in f.split("/") or not os.path.isfile(f):',
+  '        continue',
+  '    try:',
+  '        rc = subprocess.run(["grep", "-F", "-q", "-e", q, "--", f], capture_output=True, timeout=30).returncode',
+  '    except Exception:',
+  '        continue',
+  '    if rc == 1:',
+  '        stale.append(i)',
+  'print(json.dumps({"ok": True, "stale": stale}))',
+].join('\n')
+
+const STALE_SCHEMA = {
+  type: 'object',
+  required: ['ok', 'stale'],
+  additionalProperties: false,
+  properties: {
+    ok:    { type: 'boolean' },
+    stale: { type: 'array', items: { type: 'integer' } },
+  },
+}
+
+async function dropStaleFindings(findings, base, round, phaseName) {
+  const items = findings.map(function(f) { return { file: f && f.file, quote: f && f.quote } })
+  if (!items.some(function(it) { return typeof it.quote === 'string' && it.quote.trim() !== '' })) return findings
+  const r = await callAgent(
+    'Run this command at the repo root exactly as written (do not edit it) and return the JSON\n' +
+    'object it prints, field for field. If it fails to run, set ok=false and stale=[].\n\n' +
+    'python3 -c ' + shq(STALE_CHECK_PY) + ' ' + shq(JSON.stringify(items)),
+    { schema: STALE_SCHEMA, label: 'stale:' + base + ':r' + round, phase: phaseName, effort: 'low' }
+  )
+  const trusted = r && r.ok === true && Array.isArray(r.stale) && r.stale.every(function(i) {
+    return Number.isInteger(i) && i >= 0 && i < findings.length
+  })
+  if (!trusted) {
+    log('WARNING: stale-finding check for ' + base + ' returned no trustworthy result at round ' + round + ' — keeping every finding')
+    return findings
+  }
+  const drop = new Set(r.stale)
+  for (const i of drop) {
+    log('stale finding dropped (quoted line no longer in ' + findings[i].file + '): ' + findings[i].id)
+  }
+  return findings.filter(function(_f, i) { return !drop.has(i) })
+}
+
 // ─── redteam fix loop (shared by unit and phase) ──────────────────────────────
 // One loop for both levels so they cannot drift apart:
 //   review → null or findingsCount/findings mismatch = unknown (round counts, stall memory kept)
@@ -1077,6 +1133,8 @@ async function redteamFixLoop(cfg) {
       }
       continue
     }
+
+    rt.findings = await dropStaleFindings(rt.findings, cfg.base, round, cfg.phase)
 
     const blocking = blockingFindings(rt.findings)
     const nonBlocking = nonBlockingFindings(rt.findings)
