@@ -66,7 +66,7 @@ const PYTEST = '$(test -x .venv/bin/python && echo .venv/bin/python || echo pyth
 // Filled verbatim from the preflight script's JSON (see PREFLIGHT_PY below).
 const PREFLIGHT_SCHEMA = {
   type: 'object',
-  required: ['ok', 'error', 'scopePaths'],
+  required: ['ok', 'error', 'scopePaths', 'todoFacts'],
   additionalProperties: false,
   properties: {
     ok:                       { type: 'boolean' },
@@ -79,6 +79,16 @@ const PREFLIGHT_SCHEMA = {
     behindCount:              { type: 'integer' },
     lrnNext:                  { type: 'integer' },
     scopePaths:               { type: 'array', items: { type: 'string' }, description: 'The JSON list printed by the scope scan, unmodified' },
+    todoFacts: {
+      type: 'array',
+      description: 'The JSON list printed by the todo scan, unmodified',
+      items: {
+        type: 'object',
+        required: ['id', 'dependsText', 'held'],
+        additionalProperties: false,
+        properties: { id: { type: 'string' }, dependsText: { type: 'array', items: { type: 'string' } }, held: { type: 'boolean' } },
+      },
+    },
   },
 }
 
@@ -394,8 +404,8 @@ const ARCHIVE_GATE_PY = [
   '    harness=[p for p in dirty if p.startswith(hdirs) or p=="pyproject.toml"]',
   '    if os.path.exists("template/.git"):',
   '        harness+=["template/"+p for _,p in paths(git("-C","template","status","--porcelain","-uall")) if p.startswith(".claude/workflows/")]',
-  '        r=subprocess.run(["git","-C","template","rev-list","--count","@{upstream}..HEAD"],capture_output=True,text=True)',
-  '        if r.returncode!=0 or r.stdout.strip()!="0": harness.append("template/ (unpushed or no upstream: run git -C template push)")',
+  '        r=subprocess.run(["git","-C","template","merge-base","--is-ancestor","HEAD","origin/main"],capture_output=True,text=True)',
+  '        if r.returncode!=0: harness.append("template/ (unpushed or not on origin/main: merge a template PR)")',
   '    targets=set()',
   '    for f in sorted({p for p in dirty+list(scope) if p.endswith(".py")}):',
   '        if not os.path.isfile(f): continue',
@@ -455,6 +465,31 @@ const SCOPE_SCAN_PY = [
   'print(json.dumps(sorted(set(out))))',
 ].join('\n')
 
+// Deterministic todo facts, read from the wave file itself (never from the model's relay of it):
+// per todo id, the raw text after each "Depends:" and whether an unreleased HUMAN GATE marker
+// holds it. Todos marked [~] are skipped, matching the scope scan.
+const TODO_SCAN_PY = [
+  'import json,re,sys',
+  'TODO=re.compile(r"^\\s*[-*+]\\s*\\[(.)\\]\\s*"+chr(96)+r"([^"+chr(96)+r"]+)"+chr(96))',
+  'GATE=re.compile(r"^\\s*(?:[-*+]\\s*)?(?:\\*\\*)?HUMAN GATE(?:\\*\\*)?\\s*:",re.M)',
+  'REL=re.compile(r"^\\s*(?:[-*+]\\s*)?(?:\\*\\*)?Release(?:\\*\\*)?\\s*:(?:\\*\\*)?[^\\n]*https://github\\.com/[\\w.-]+/[\\w.-]+/issues/\\d+",re.I|re.M)',
+  'out=[]; cur=None',
+  'def flush():',
+  '    if cur is None or cur["skip"]: return',
+  '    body="".join(cur["lines"])',
+  '    dep=[m.group(1).strip() for l in cur["lines"] for m in [re.search(r"Depends:(?:\\*\\*)?\\s*(.*)$",l,re.I)] if m]',
+  '    out.append({"id":cur["id"],"dependsText":dep,"held":bool(GATE.search(body)) and not REL.search(body)})',
+  'for l in open(sys.argv[1],encoding="utf-8"):',
+  '    m=TODO.match(l)',
+  '    if m:',
+  '        flush(); cur={"id":m.group(2).strip(),"skip":m.group(1)=="~","lines":[]}; continue',
+  '    if re.match(r"\\s*#{1,6}\\s",l):',
+  '        flush(); cur=None; continue',
+  '    if cur is not None: cur["lines"].append(l)',
+  'flush()',
+  'print(json.dumps(out))',
+].join('\n')
+
 function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
 
 // Shared path rule for the deliverable gate: the scope scan's own head (EXT/ROOT/DOT lists and
@@ -462,23 +497,43 @@ function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
 const PATH_RULE_PY = SCOPE_SCAN_PY.slice(0, SCOPE_SCAN_PY.indexOf('\nout=[]; skip=False'))
 
 // Deliverable gate: one run per Implement tier. A concrete Creates: path must exist; an
-// acceptance record (basename contains "acceptance") must also carry "Verdict: PASS" and no
-// "[pending"; a pattern path (glob) needs a match newer than Implement start.
+// acceptance record (workspace/acceptance/*.md) must also carry a FIRST verdict of PASS (heading
+// form or "Verdict: X" line form) and no "[pending"; a pattern path (glob, or a planner
+// placeholder such as LRN-NNN / run-NNN / C-NNN) needs a match newer than Implement start. A
+// missing or malformed "since" counts every pattern path as missing.
 const DELIVERABLE_GATE_PY = PATH_RULE_PY + '\n' + [
   'import os,glob',
   'spec=json.loads(sys.argv[1])',
-  'since=float(spec["since"])',
-  'def pat(t): return ("*" in t or "?" in t) and ok(t.replace("*","x").replace("?","x"))',
-  'def record(p): return "acceptance" in p.rsplit("/",1)[-1].lower()',
+  's=spec.get("since")',
+  'since=float(s) if isinstance(s,(int,float)) and not isinstance(s,bool) else None',
+  'PH=re.compile(r"(?<![A-Za-z])N{3,}(?![A-Za-z])")',
+  'V=re.compile(r"^[\\s>*_-]*(?:#+[\\s*_]*)?verdict\\b[\\s*_]*:?[\\s*_]*([A-Za-z]*)",re.I)',
+  'def has_ph(t): return PH.search(t) is not None',
+  'def pat(t): return ("*" in t or "?" in t or has_ph(t)) and ok(PH.sub("0",t).replace("*","x").replace("?","x"))',
+  'def concrete(t): return ok(t) and not has_ph(t)',
+  'def gl(t): return PH.sub("[0-9]*",t)',
+  'def record(p): return p.startswith("workspace/acceptance/") and p[-3:]==".md"',
+  'def verdict(s):',
+  '    ls=s.splitlines()',
+  '    for i,l in enumerate(ls):',
+  '        m=V.match(l)',
+  '        if not m: continue',
+  '        if m.group(1): return m.group(1).upper()',
+  '        for n in ls[i+1:]:',
+  '            if n.strip():',
+  '                k=re.match(r"^[\\s>*_-]*([A-Za-z]+)",n)',
+  '                return k.group(1).upper() if k else ""',
+  '        return ""',
+  '    return ""',
   'def good(p):',
   '    if not os.path.isfile(p): return False',
   '    if not record(p): return True',
   '    s=open(p,encoding="utf-8",errors="replace").read()',
-  '    return re.search(r"^[\\s>*_-]*verdict[\\s*_]*:[\\s*_]*PASS\\b",s,re.I|re.M) is not None and "[pending" not in s.lower()',
-  'def fresh(p): return any(os.path.isfile(m) and os.path.getmtime(m)>since for m in glob.glob(p,recursive=True))',
+  '    return verdict(s)=="PASS" and "[pending" not in s.lower()',
+  'def fresh(g): return since is not None and any(os.path.isfile(m) and os.path.getmtime(m)>since for m in glob.glob(g,recursive=True))',
   'bad=[]',
   'for label,paths in spec["groups"].items():',
-  '    miss=[p for p in paths if (ok(p) and not good(p)) or (pat(p) and not fresh(p))]',
+  '    miss=[p for p in paths if (concrete(p) and not good(p)) or (pat(p) and not fresh(gl(p)))]',
   '    if miss: bad.append({"label":label,"paths":miss})',
   'print(json.dumps({"ok":True,"checked":sorted(spec["groups"]),"missing":bad}))',
 ].join('\n')
@@ -510,38 +565,33 @@ const SCOPE_RESCAN_SCHEMA = {
   properties: { paths: { type: 'array', items: { type: 'string' }, description: 'The JSON list printed by the scope scan, unmodified' } },
 }
 
-// A HUMAN GATE todo holds its group until a release line cites a GitHub issue URL. Only the
-// explicit marker gates; free text such as "Status: NOT DONE" never does.
-const HUMAN_GATE_RE = /^\s*(?:[-*+]\s*)?(?:\*\*)?HUMAN GATE(?:\*\*)?\s*:/m
-const HUMAN_RELEASE_RE = /^\s*(?:[-*+]\s*)?(?:\*\*)?Release(?:\*\*)?\s*:(?:\*\*)?[^\n]*https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d+/im
+// A HUMAN GATE todo holds its group until a release line cites a GitHub issue URL. The hold
+// comes from TODO_SCAN_PY (a script reading the wave file), stamped on each group by parseWave.
 function groupIsHeld(g) {
-  return g.todos.some(function(t) {
-    const b = String((t && t.body) || '')
-    return HUMAN_GATE_RE.test(b) && !HUMAN_RELEASE_RE.test(b)
-  })
+  return g.held === true
 }
 
-// Group deps derived from each todo's Depends: line, unioned with the model's groupDeps.
+// Group deps derived from each todo's Depends: text as read by TODO_SCAN_PY, unioned with the
+// model's groupDeps.
 function deriveGroupDeps(w) {
   const owner = {}
   w.groups.forEach(function(g) { g.todos.forEach(function(t) { owner[t.id] = g.label }) })
   const ids = Object.keys(owner)
-  const out = {}
-  w.groups.forEach(function(g) {
-    const found = new Set((w.groupDeps && w.groupDeps[g.label]) || [])
-    g.todos.forEach(function(t) {
-      String((t && t.body) || '').split('\n').forEach(function(line) {
-        const m = /Depends:(?:\*\*)?\s*(.*)$/i.exec(line)
-        if (!m) return
-        ids.forEach(function(id) {
-          if (owner[id] === g.label) return
-          const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-          if (new RegExp('(^|[^A-Za-z0-9_-])' + esc + '($|[^A-Za-z0-9_-])').test(m[1])) found.add(owner[id])
-        })
+  const found = {}
+  w.groups.forEach(function(g) { found[g.label] = new Set((w.groupDeps && w.groupDeps[g.label]) || []) })
+  ;(w.todoFacts || []).forEach(function(f) {
+    const mine = owner[f.id]
+    if (mine === undefined) return
+    f.dependsText.forEach(function(text) {
+      ids.forEach(function(id) {
+        if (owner[id] === mine) return
+        const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        if (new RegExp('(^|[^A-Za-z0-9_-])' + esc + '($|[^A-Za-z0-9_-])').test(text)) found[mine].add(owner[id])
       })
     })
-    out[g.label] = Array.from(found)
   })
+  const out = {}
+  w.groups.forEach(function(g) { out[g.label] = Array.from(found[g.label]) })
   return out
 }
 
@@ -724,17 +774,23 @@ phase('Parse')
 
 async function runPreflight(label) {
   const pf = await callAgent(
-    'Run the two commands below at the repo root exactly as written (do not edit them).\n' +
-    'Return the JSON object the first one prints, field for field, and set scopePaths to the\n' +
-    'JSON list the second one prints, unmodified. If a command fails to run, set ok=false and\n' +
+    'Run the three commands below at the repo root exactly as written (do not edit them).\n' +
+    'Return the JSON object the first one prints, field for field, set scopePaths to the\n' +
+    'JSON list the second one prints, unmodified, and set todoFacts to the JSON list the third\n' +
+    'one prints, unmodified. If a command fails to run, set ok=false and\n' +
     'put its error text in error.\n\n' +
     'python3 - ' + shq(WAVE_FILE) + " <<'PREFLIGHT'\n" + PREFLIGHT_PY + '\nPREFLIGHT\n\n' +
-    'python3 - ' + shq(WAVE_FILE) + " <<'SCOPE_SCAN'\n" + SCOPE_SCAN_PY + '\nSCOPE_SCAN',
+    'python3 - ' + shq(WAVE_FILE) + " <<'SCOPE_SCAN'\n" + SCOPE_SCAN_PY + '\nSCOPE_SCAN\n\n' +
+    'python3 - ' + shq(WAVE_FILE) + " <<'TODO_SCAN'\n" + TODO_SCAN_PY + '\nTODO_SCAN',
     { schema: PREFLIGHT_SCHEMA, label: label, phase: 'Parse', effort: 'low' }
   )
   // Unknown state is never "nothing found": a failed or malformed preflight stops the wave.
   const wellFormed = pf && pf.ok === true &&
     Array.isArray(pf.scopePaths) && Array.isArray(pf.otherActiveWaves) &&
+    Array.isArray(pf.todoFacts) && pf.todoFacts.every(function(f) {
+      return f && typeof f.id === 'string' && typeof f.held === 'boolean' &&
+        Array.isArray(f.dependsText) && f.dependsText.every(function(d) { return typeof d === 'string' })
+    }) &&
     ['wrongRunnerForRepoLayout', 'completedFileExists', 'templateDirExists'].every(function(k) { return typeof pf[k] === 'boolean' }) &&
     ['dirtyPathCount', 'behindCount', 'lrnNext'].every(function(k) { return Number.isInteger(pf[k]) })
   if (!wellFormed) {
@@ -781,11 +837,24 @@ async function parseWave(pf, label) {
   w.allCreates  = uniq(w.allCreates)
   w.allModifies = uniq(w.allModifies)
   w.allScope    = uniq(w.allCreates.concat(w.allModifies))
+  // Deps and holds come from the todo scan of the wave file, not from the model's relay of it;
+  // a todo the scan found that the model's groups lack means Parse dropped text.
+  const modelIds = new Set()
+  w.groups.forEach(function(g) { g.todos.forEach(function(t) { modelIds.add(t && t.id) }) })
+  const unseen = pf.todoFacts.map(function(f) { return f.id }).filter(function(id) { return !modelIds.has(id) })
+  if (unseen.length > 0) {
+    log('ERROR: wave ' + w.waveId + ' Parse is missing ' + unseen.length + ' todo(s) the deterministic todo scan found: ' +
+        unseen.join(', ') + ' — aborting rather than running with dropped Depends:/HUMAN GATE text. Re-run.')
+    return { error: 'todo-scan-mismatch', waveId: w.waveId, missed: unseen }
+  }
+  w.todoFacts   = pf.todoFacts
+  const heldIds = new Set(pf.todoFacts.filter(function(f) { return f.held }).map(function(f) { return f.id }))
   w.groupDeps   = deriveGroupDeps(w)
   for (const g of w.groups) {
     g.creates  = uniq(g.creates)
     g.modifies = uniq(g.modifies)
     g.scope    = uniq(g.creates.concat(g.modifies))
+    g.held     = g.todos.some(function(t) { return heldIds.has(t && t.id) })
   }
   // The scan is the ground truth for which paths exist on Creates:/Modifies: lines; a path
   // the read missed would silently narrow every gate keyed off allScope.
@@ -1140,7 +1209,29 @@ const failedGroups = new Set()    // deliverables missing at the gate, or held a
 const heldGroups = new Set()
 const prunedGroups = new Set()    // transitively depend on a failed group; never dispatched
 const remainingGroups = wave.groups.slice()
-const implementStartSec = typeof Date !== 'undefined' ? Math.floor(Date.now() / 1000) : 0
+const CLOCK_SCHEMA = {
+  type: 'object',
+  required: ['now'],
+  additionalProperties: false,
+  properties: { now: { type: 'number' } },
+}
+
+// The sandbox bans Date, so the Implement start time comes from a deterministic shell step.
+// A null or malformed result returns null: the deliverable gate then counts every pattern
+// path as missing (fail closed).
+async function readImplementStart() {
+  const r = await callAgent(
+    'Run this command at the repo root exactly as written (do not edit it) and return the JSON\n' +
+    'object it prints, field for field.\n\n' +
+    'python3 -c ' + shq('import json,time;print(json.dumps({"now":time.time()}))'),
+    { schema: CLOCK_SCHEMA, label: 'clock:implement-start', phase: 'Implement', effort: 'low' }
+  )
+  if (r && typeof r.now === 'number' && isFinite(r.now) && r.now > 1e9) return r.now
+  log('WARNING: Implement start time unavailable — every pattern Creates: path counts as missing (fail closed)')
+  return null
+}
+
+const implementStartSec = await readImplementStart()
 let tierNo = 0
 
 function pruneDependents() {
@@ -1265,6 +1356,7 @@ const STALE_CHECK_PY = [
   'import json, os, subprocess, sys',
   'items = json.loads(sys.argv[1])',
   'stale = []',
+  'present = []',
   'for i, it in enumerate(items):',
   '    f, q = it.get("file") or "", it.get("quote") or ""',
   '    if not q.strip() or not f or os.path.isabs(f) or ".." in f.split("/") or not os.path.isfile(f):',
@@ -1275,7 +1367,9 @@ const STALE_CHECK_PY = [
   '        continue',
   '    if rc == 1:',
   '        stale.append(i)',
-  'print(json.dumps({"ok": True, "stale": stale}))',
+  '    elif rc == 0:',
+  '        present.append(i)',
+  'print(json.dumps({"ok": True, "stale": stale, "present": present}))',
 ].join('\n')
 
 const STALE_SCHEMA = {
@@ -1283,12 +1377,16 @@ const STALE_SCHEMA = {
   required: ['ok', 'stale'],
   additionalProperties: false,
   properties: {
-    ok:    { type: 'boolean' },
-    stale: { type: 'array', items: { type: 'integer' } },
+    ok:      { type: 'boolean' },
+    stale:   { type: 'array', items: { type: 'integer' } },
+    present: { type: 'array', items: { type: 'integer' } },
   },
 }
 
-async function dropStaleFindings(findings, base, round, phaseName) {
+// Only a quote this loop has already seen present can go stale: a quote that was never in the
+// file (invented, elided with "...", carrying a line-number prefix) is unverifiable, and the
+// finding stays blocking. Round 1 therefore records presence and never drops.
+async function dropStaleFindings(findings, base, round, phaseName, verified) {
   const items = findings.map(function(f) { return { file: f && f.file, quote: f && f.quote } })
   if (!items.some(function(it) { return typeof it.quote === 'string' && it.quote.trim() !== '' })) return findings
   const r = await callAgent(
@@ -1297,17 +1395,24 @@ async function dropStaleFindings(findings, base, round, phaseName) {
     'python3 -c ' + shq(STALE_CHECK_PY) + ' ' + shq(JSON.stringify(items)),
     { schema: STALE_SCHEMA, label: 'stale:' + base + ':r' + round, phase: phaseName, effort: 'low' }
   )
-  const trusted = r && r.ok === true && Array.isArray(r.stale) && r.stale.every(function(i) {
-    return Number.isInteger(i) && i >= 0 && i < findings.length
-  })
+  const validIdx = function(i) { return Number.isInteger(i) && i >= 0 && i < findings.length }
+  const trusted = r && r.ok === true && Array.isArray(r.stale) && r.stale.every(validIdx) &&
+    (r.present === undefined || (Array.isArray(r.present) && r.present.every(validIdx)))
   if (!trusted) {
     log('WARNING: stale-finding check for ' + base + ' returned no trustworthy result at round ' + round + ' — keeping every finding')
     return findings
   }
-  const drop = new Set(r.stale)
-  for (const i of drop) {
-    log('stale finding dropped (quoted line no longer in ' + findings[i].file + '): ' + findings[i].id)
+  const keyOf = function(f) { return String(f.file) + '\u0000' + String(f.quote) }
+  const drop = new Set()
+  for (const i of r.stale) {
+    if (verified.has(keyOf(findings[i]))) {
+      drop.add(i)
+      log('stale finding dropped (quoted line no longer in ' + findings[i].file + '): ' + findings[i].id)
+    } else {
+      log('unverifiable quote kept (never found in ' + findings[i].file + '): ' + findings[i].id)
+    }
   }
+  ;(r.present || []).forEach(function(i) { verified.add(keyOf(findings[i])) })
   return findings.filter(function(_f, i) { return !drop.has(i) })
 }
 
@@ -1325,6 +1430,7 @@ async function redteamFixLoop(cfg) {
   const nonBlockingStore = []
   const nonBlockingSigs = new Set()
   let outcome = 'clean'
+  const verifiedQuotes = new Set()   // file+quote pairs seen present in an earlier or current round
 
   while (true) {
     round++
@@ -1353,7 +1459,7 @@ async function redteamFixLoop(cfg) {
       continue
     }
 
-    rt.findings = await dropStaleFindings(rt.findings, cfg.base, round, cfg.phase)
+    rt.findings = await dropStaleFindings(rt.findings, cfg.base, round, cfg.phase, verifiedQuotes)
 
     const blocking = blockingFindings(rt.findings)
     const nonBlocking = nonBlockingFindings(rt.findings)

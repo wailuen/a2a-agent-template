@@ -113,6 +113,9 @@ function buildScenarioPrompt(s, a) {
     '   task/context ids are saved only on success). Do NOT write your own httpx script:\n\n' +
     '   ACC_QUERY="QUERY_TEXT" .venv/bin/python3 -m agent_sdk.testing.turns --transport a2a \\\n' +
     '       --base-url ' + a.baseUrl + ' --key-file ' + a._keyFile + ' --run-key ' + runKey + '\n\n' +
+    '   Run this Bash command with timeout 600000 (ms). The default Bash timeout (120 s) is shorter\n' +
+    '   than the helper budget and would kill it before it prints. The helper always prints one JSON\n' +
+    '   line before 600 s. Never score a turn from a killed or empty Bash call.\n\n' +
     '   Parse the JSON on stdout: {ok, reply, contentTypes, attempts} on success, or\n' +
     '   {ok:false, failureClass, reason, status, attempts} on failure. Never print the key.\n' +
     '   If ok=false and failureClass="rate-limited", the turn was throttled by the server\n' +
@@ -153,6 +156,8 @@ function buildScenarioPrompt(s, a) {
     '   restored on a failed attempt so a retry never duplicates the user message):\n\n' +
     '   ACC_QUERY="QUERY_TEXT" .venv/bin/python3 -m agent_sdk.testing.turns --transport agui \\\n' +
     '       --base-url ' + a.baseUrl + ' --key-file ' + a._keyFile + ' --run-key ' + runKey + '\n\n' +
+    '   Run this Bash command with timeout 600000 (ms) (the helper prints one JSON line before 600 s;\n' +
+    '   the default 120 s Bash timeout would kill it first).\n\n' +
     '   Parse: {ok, reply, toolsCalled, contentTypes, attempts}. A failure with\n' +
     '   failureClass="rate-limited" is handled exactly as for A2A (not scored 1–2).\n\n' +
 
@@ -195,7 +200,7 @@ function buildScenarioPrompt(s, a) {
 
     'RULES:\n' +
     '- A rate-limited turn (helper failureClass "rate-limited") is never scored 1–2; omit it from min scores.\n' +
-    '  If every turn on a transport was rate-limited, score that transport 10 and set failureClass "rate-limited".\n' +
+    '  If every turn on a transport was rate-limited, set that transport's minScore to 1 (schema minimum, not a score), passed=false and failureClass "rate-limited". Untested turns are "not run", never 10/10.\n' +
     '- Never hard-fail on a network timeout — score the turn 1, rationale "timeout".\n' +
     '- If only one transport was run (--transport flag), set the other minScore to 10 and turns to [].\n' +
     '- Return structured output matching the schema exactly.\n'
@@ -249,7 +254,10 @@ const rawResults = await pipeline(
 const ranA2A  = transports.indexOf('a2a') !== -1
 const ranAGUI = transports.indexOf('agui') !== -1
 const results = rawResults.map(function(r, i) {
-  if (r != null) return r
+  if (r != null) {
+    // Infrastructure failure class must never count as a pass (GH-210).
+    return r.failureClass === 'rate-limited' ? Object.assign({}, r, { passed: false }) : r
+  }
   const s = scenarios[i]
   return {
     scenarioId:    s.id,
@@ -269,10 +277,11 @@ if (results.length !== scenarios.length) {
 }
 
 const passed     = results.filter(function(r) { return r.passed }).length
-const failed     = results.filter(function(r) { return !r.passed }).length
-const a2aMin     = results.length > 0 ? results.reduce(function(m, r) { return Math.min(m, r.a2aMinScore) }, 10) : 0
-const aguiMin    = results.length > 0 ? results.reduce(function(m, r) { return Math.min(m, r.aguiMinScore) }, 10) : 0
 const rateLimited = results.filter(function(r) { return r.failureClass === 'rate-limited' }).length
+const failed     = results.filter(function(r) { return !r.passed && r.failureClass !== 'rate-limited' }).length
+const scored     = results.filter(function(r) { return r.failureClass !== 'rate-limited' })
+const a2aMin     = scored.length > 0 ? scored.reduce(function(m, r) { return Math.min(m, r.a2aMinScore) }, 10) : 0
+const aguiMin    = scored.length > 0 ? scored.reduce(function(m, r) { return Math.min(m, r.aguiMinScore) }, 10) : 0
 const diverged   = results.filter(function(r) { return r.failureClass === 'transport-divergence' }).length
 
 log(
@@ -280,7 +289,7 @@ log(
   '  |  A2A min: ' + a2aMin + '/10' +
   '  |  AG-UI min: ' + aguiMin + '/10' +
   (diverged ? '  |  transport-divergence: ' + diverged : '') +
-  (rateLimited ? '  |  rate-limited: ' + rateLimited : '') +
+  (rateLimited ? '  |  not run (rate-limited): ' + rateLimited : '') +
   '  |  failed: ' + failed
 )
 
