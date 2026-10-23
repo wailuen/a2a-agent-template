@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     # Pinned by commit SHA (tags are mutable; SHAs aren't). Tag: v0.4.0
     # Latest: see sdk CHANGELOG or `git ls-remote --tags origin` on a2a-sdk.
+    # {{SDK_SHA}} must resolve to agent-sdk >= 0.18.0 (acceptance workflow uses agent_sdk.testing.turns).
     # To upgrade: replace the SHA with the new commit SHA from the sdk CHANGELOG.
     "agent-sdk @ git+ssh://{{SDK_GIT_URL}}@{{SDK_SHA}}",
     # The template owns exact pins; the SDK declares lower bounds only.
