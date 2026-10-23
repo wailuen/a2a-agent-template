@@ -1443,20 +1443,33 @@ const FILE_SDK_ISSUES_PY = [
   'COMPONENTS = {"harness/skill", "harness/workflow", "harness/agent", "harness/template", "sdk/build", "sdk/loop", "sdk/credentials", "sdk/console", "protocol/a2a", "protocol/mcp", "protocol/ag-ui", "protocol/a2ui", "protocol/oauth", "security"}',
   'KEYLIKE = re.compile(r"\\b(?:sk|ak)[-_][A-Za-z0-9_-]+", re.I)',
   'TOKEN = re.compile(r"\\b(?:ghp|gho|ghu|ghs|github_pat|xox[abpr]|AKIA)[A-Za-z0-9_-]{8,}")',
+  'XOX = re.compile(r"\\bxox[a-z]-[A-Za-z0-9-]+")',
+  'GOOGLE = re.compile(r"\\bAIza[0-9A-Za-z_-]{35}")',
+  'JWT = re.compile(r"\\beyJ[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*")',
+  'BASIC = re.compile(r"\\bBasic\\s+[A-Za-z0-9+/]{12,}={0,2}")',
+  'GLPAT = re.compile(r"\\bglpat-[A-Za-z0-9_-]+")',
+  'STRIPE = re.compile(r"\\b(?:pk|rk|sk)_(?:live|test)_[A-Za-z0-9]+")',
+  'ASSIGN = re.compile(r"\\b(?:password|passwd|secret|token|api[_-]?key)\\s*[=:]\\s*\\S+", re.I)',
   'BEARER = re.compile(r"\\bbearer\\s+[A-Za-z0-9._~+/=-]+", re.I)',
   'HEX = re.compile(r"\\b[A-Fa-f0-9]{32,}\\b")',
-  'LONG = re.compile(r"[A-Za-z0-9+_-]{40,}={0,2}")',
+  'LONG = re.compile(r"[A-Za-z0-9+/._-]{32,}={0,2}")',
+  'PATS = (KEYLIKE, TOKEN, XOX, GOOGLE, JWT, BASIC, GLPAT, STRIPE, ASSIGN, BEARER, HEX)',
   'LOOSE = re.compile(r"\\b(?:sk|ak)[-_]", re.I)',
   'def mixed(m):',
   '    s = m.group(0)',
   '    return "[REDACTED]" if re.search(r"[a-z]", s) and re.search(r"[A-Z]", s) and re.search(r"[0-9]", s) else s',
   'def redact(s):',
   '    s = str(s or "")',
-  '    for p in (KEYLIKE, TOKEN, BEARER, HEX):',
+  '    for p in PATS:',
   '        s = p.sub("[REDACTED]", s)',
   '    return LONG.sub(mixed, s)',
   'def leaks(s):',
-  '    return any(p.search(s) for p in (KEYLIKE, TOKEN, BEARER, HEX, LOOSE)) or LONG.sub(mixed, s) != s',
+  '    return any(p.search(s) for p in PATS + (LOOSE,)) or LONG.sub(mixed, s) != s',
+  'def ensure_label(name):',
+  '    try:',
+  '        return gh(["label", "create", name, "-R", REPO, "--force"]).returncode == 0',
+  '    except Exception:',
+  '        return False',
   'def norm(t):',
   '    return " ".join(str(t).lower().split())',
   'def gh(argv):',
@@ -1496,10 +1509,14 @@ const FILE_SDK_ISSUES_PY = [
   '    try:',
   '        with os.fdopen(fd, "w") as fh:',
   '            fh.write(body)',
-  '        argv = ["issue", "create", "-R", REPO, "--title", title, "--body-file", tmp, "--label", "auto-filed"]',
-  '        if comp in COMPONENTS:',
+  '        argv = ["issue", "create", "-R", REPO, "--title", title, "--body-file", tmp]',
+  '        if ensure_label("auto-filed"):',
+  '            argv += ["--label", "auto-filed"]',
+  '        if comp in COMPONENTS and ensure_label(comp):',
   '            argv += ["--label", comp]',
   '        r = gh(argv)',
+  '        if r.returncode != 0 and "--label" in argv:',
+  '            r = gh(["issue", "create", "-R", REPO, "--title", title, "--body-file", tmp])',
   '    except Exception:',
   '        r = None',
   '    finally:',
@@ -1539,16 +1556,16 @@ const FILE_SCHEMA = {
 const AUTO_FILE_SDK_ISSUES = normalizedArgs.autoFileSdkIssues === true || normalizedArgs.autoFileSdkIssues === 'true'
 
 function originalFinding(c) {
-  return toCodeify.find(function(f) { return f.id === c.id && (!c.file || f.file === c.file) }) ||
-         toCodeify.find(function(f) { return f.id === c.id }) || null
+  const hits = toCodeify.filter(function(f) { return f.id === c.id && f.file === c.file && f.quote === c.quote })
+  return hits.length === 1 ? hits[0] : null
 }
 
 // fixed-in-wave only when the quote is gone now AND was seen present earlier in this wave;
 // every other outcome (empty quote, never verified, bad path, untrusted result) is still-open.
 async function candidateStatuses(candidates) {
   const statuses = candidates.map(function() { return 'still-open' })
-  const subjects = candidates.map(function(c) { return originalFinding(c) || c })
-  const items = subjects.map(function(s) { return { file: s.file, quote: s.quote } })
+  const subjects = candidates.map(originalFinding)
+  const items = subjects.map(function(s, i) { return s ? { file: s.file, quote: s.quote } : { file: candidates[i].file, quote: '' } })
   if (!items.some(function(it) { return typeof it.quote === 'string' && it.quote.trim() !== '' })) return statuses
   const r = await runStaleScript(items, 'sdk:recheck', 'Codify')
   if (!r) {
@@ -1556,7 +1573,7 @@ async function candidateStatuses(candidates) {
     return statuses
   }
   for (const i of r.stale) {
-    if (WAVE_VERIFIED_QUOTES.has(staleKey(subjects[i]))) statuses[i] = 'fixed-in-wave'
+    if (subjects[i] && WAVE_VERIFIED_QUOTES.has(staleKey(subjects[i]))) statuses[i] = 'fixed-in-wave'
   }
   return statuses
 }
