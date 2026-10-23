@@ -68,6 +68,13 @@ For each wave whose `Depends:` items are all in `completed/`:
      args: { waveFile: "<absolute path to active wave file>", today: "<YYYY-MM-DD>" }
    })
    ```
+   `args.autoFileSdkIssues` (optional boolean, default `false`) turns on auto-filing at
+   codify: each SDK candidate is re-checked against the final tree and tagged
+   `Status: fixed-in-wave | still-open` in `workspace/sdk-candidates.md`; only `still-open`
+   ones are filed on `wailuen/a2a-sdk` (deduped, at most 10, credential-redacted, `-R` on
+   every `gh` call, title and body from classified fields only). The issue URL is written
+   back to the file. If `gh` is missing or unauthenticated the candidates stay in the file
+   and the wave still finishes. Default `false` files nothing; use `/sdk-issue-scan`.
    The workflow runs 8 phases for this wave:
    - **Parse** — reads wave file; extracts groups, creates paths, inter-group dependency map (`groupDeps`), and LRN baseline.
    - **Todos Redteam** — annotates todos with `SI:` fields and `Reuses: C-NNN` before

@@ -17,6 +17,8 @@ export const meta = {
 // args.waveFile    : path to the active wave file
 // args.today       : ISO date string for plan.md timestamps (the sandbox bans Date)
 // args.agentBudget : optional positive override of the per-wave agent-call ceiling
+// args.autoFileSdkIssues : optional boolean (default false); true files still-open SDK candidates
+//                    on wailuen/a2a-sdk at codify (deduped, capped at 10, redacted)
 // args may arrive JSON-encoded as a string; fail fast naming whatever is missing.
 let normalizedArgs
 if (typeof args === 'string') {
@@ -271,9 +273,11 @@ const SDK_SCAN_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['description', 'severity', 'component', 'rationale'],
+        required: ['id', 'quote', 'description', 'severity', 'component', 'rationale'],
         additionalProperties: false,
         properties: {
+          id:          { type: 'string' },
+          quote:       { type: 'string' },
           description: { type: 'string' },
           severity:    { type: 'string' },
           component:   { type: 'string' },
@@ -1386,23 +1390,35 @@ const STALE_SCHEMA = {
 // Only a quote this loop has already seen present can go stale: a quote that was never in the
 // file (invented, elided with "...", carrying a line-number prefix) is unverifiable, and the
 // finding stays blocking. Round 1 therefore records presence and never drops.
-async function dropStaleFindings(findings, base, round, phaseName, verified) {
-  const items = findings.map(function(f) { return { file: f && f.file, quote: f && f.quote } })
-  if (!items.some(function(it) { return typeof it.quote === 'string' && it.quote.trim() !== '' })) return findings
+// GH-223: every file+quote pair seen present by any stale check this wave. A candidate whose
+// quote is gone now but was seen present earlier was fixed in-wave; a quote never seen present
+// stays still-open.
+const WAVE_VERIFIED_QUOTES = new Set()
+const staleKey = function(f) { return String(f.file) + '\u0000' + String(f.quote) }
+
+// Runs STALE_CHECK_PY over {file, quote} items; null unless the result is trustworthy.
+async function runStaleScript(items, label, phaseName) {
   const r = await callAgent(
     'Run this command at the repo root exactly as written (do not edit it) and return the JSON\n' +
     'object it prints, field for field. If it fails to run, set ok=false and stale=[].\n\n' +
     'python3 -c ' + shq(STALE_CHECK_PY) + ' ' + shq(JSON.stringify(items)),
-    { schema: STALE_SCHEMA, label: 'stale:' + base + ':r' + round, phase: phaseName, effort: 'low' }
+    { schema: STALE_SCHEMA, label: label, phase: phaseName, effort: 'low' }
   )
-  const validIdx = function(i) { return Number.isInteger(i) && i >= 0 && i < findings.length }
+  const validIdx = function(i) { return Number.isInteger(i) && i >= 0 && i < items.length }
   const trusted = r && r.ok === true && Array.isArray(r.stale) && r.stale.every(validIdx) &&
     (r.present === undefined || (Array.isArray(r.present) && r.present.every(validIdx)))
-  if (!trusted) {
+  return trusted ? r : null
+}
+
+async function dropStaleFindings(findings, base, round, phaseName, verified) {
+  const items = findings.map(function(f) { return { file: f && f.file, quote: f && f.quote } })
+  if (!items.some(function(it) { return typeof it.quote === 'string' && it.quote.trim() !== '' })) return findings
+  const r = await runStaleScript(items, 'stale:' + base + ':r' + round, phaseName)
+  if (!r) {
     log('WARNING: stale-finding check for ' + base + ' returned no trustworthy result at round ' + round + ' — keeping every finding')
     return findings
   }
-  const keyOf = function(f) { return String(f.file) + '\u0000' + String(f.quote) }
+  const keyOf = staleKey
   const drop = new Set()
   for (const i of r.stale) {
     if (verified.has(keyOf(findings[i]))) {
@@ -1412,8 +1428,164 @@ async function dropStaleFindings(findings, base, round, phaseName, verified) {
       log('unverifiable quote kept (never found in ' + findings[i].file + '): ' + findings[i].id)
     }
   }
-  ;(r.present || []).forEach(function(i) { verified.add(keyOf(findings[i])) })
+  ;(r.present || []).forEach(function(i) { verified.add(keyOf(findings[i])); WAVE_VERIFIED_QUOTES.add(keyOf(findings[i])) })
   return findings.filter(function(_f, i) { return !drop.has(i) })
+}
+
+// GH-223: opt-in auto-filing of still-open SDK candidates. The deterministic script below does the
+// redaction, the dedupe search and the filing; no model writes a gh command. Title and body come
+// only from classified fields (never quote or code), every gh call carries -R wailuen/a2a-sdk,
+// and the body goes through --body-file.
+const FILE_SDK_ISSUES_PY = [
+  'import json, re, shutil, subprocess, sys, tempfile, os',
+  'REPO = "wailuen/a2a-sdk"',
+  'CAP = 10',
+  'COMPONENTS = {"harness/skill", "harness/workflow", "harness/agent", "harness/template", "sdk/build", "sdk/loop", "sdk/credentials", "sdk/console", "protocol/a2a", "protocol/mcp", "protocol/ag-ui", "protocol/a2ui", "protocol/oauth", "security"}',
+  'KEYLIKE = re.compile(r"\\b(?:sk|ak)[-_][A-Za-z0-9_-]+", re.I)',
+  'TOKEN = re.compile(r"\\b(?:ghp|gho|ghu|ghs|github_pat|xox[abpr]|AKIA)[A-Za-z0-9_-]{8,}")',
+  'BEARER = re.compile(r"\\bbearer\\s+[A-Za-z0-9._~+/=-]+", re.I)',
+  'HEX = re.compile(r"\\b[A-Fa-f0-9]{32,}\\b")',
+  'LONG = re.compile(r"[A-Za-z0-9+_-]{40,}={0,2}")',
+  'LOOSE = re.compile(r"\\b(?:sk|ak)[-_]", re.I)',
+  'def mixed(m):',
+  '    s = m.group(0)',
+  '    return "[REDACTED]" if re.search(r"[a-z]", s) and re.search(r"[A-Z]", s) and re.search(r"[0-9]", s) else s',
+  'def redact(s):',
+  '    s = str(s or "")',
+  '    for p in (KEYLIKE, TOKEN, BEARER, HEX):',
+  '        s = p.sub("[REDACTED]", s)',
+  '    return LONG.sub(mixed, s)',
+  'def leaks(s):',
+  '    return any(p.search(s) for p in (KEYLIKE, TOKEN, BEARER, HEX, LOOSE)) or LONG.sub(mixed, s) != s',
+  'def norm(t):',
+  '    return " ".join(str(t).lower().split())',
+  'def gh(argv):',
+  '    return subprocess.run(["gh"] + argv, capture_output=True, text=True, timeout=60)',
+  'data = json.loads(sys.argv[1])',
+  'out = {"ok": True, "ghAvailable": True, "results": []}',
+  'prepared = []',
+  'for c in data.get("candidates") or []:',
+  '    desc = redact(c.get("description")).strip()',
+  '    title = " ".join(desc.split())[:120]',
+  '    fields = [desc, redact(c.get("component")), redact(c.get("severity")), redact(c.get("file"))]',
+  '    if not title or any(leaks(f) for f in fields):',
+  '        out["results"].append({"index": c.get("index"), "status": "skipped-secret"})',
+  '    else:',
+  '        prepared.append((c.get("index"), title, desc, fields[1], fields[2], fields[3]))',
+  'if prepared and not shutil.which("gh"):',
+  '    out["ghAvailable"] = False',
+  '    prepared = []',
+  'filed = 0',
+  'for idx, title, desc, comp, sev, path in prepared:',
+  '    if filed >= CAP:',
+  '        out["results"].append({"index": idx, "status": "capped"})',
+  '        continue',
+  '    try:',
+  '        r = gh(["issue", "list", "-R", REPO, "--state", "open", "--search", title, "--json", "number,title,url", "--limit", "20"])',
+  '        if r.returncode != 0:',
+  '            raise RuntimeError("list failed")',
+  '        hits = [h for h in json.loads(r.stdout or "[]") if norm(h.get("title")) == norm(title)]',
+  '    except Exception:',
+  '        out["ghAvailable"] = False',
+  '        break',
+  '    if hits:',
+  '        out["results"].append({"index": idx, "status": "duplicate", "url": hits[0].get("url", "")})',
+  '        continue',
+  '    body = "Auto-filed from wave %s.\\n\\nComponent: %s\\nSeverity: %s\\nFile: %s\\n\\n%s\\n" % (redact(data.get("waveId")), comp, sev, path or "n/a", desc)',
+  '    fd, tmp = tempfile.mkstemp(suffix=".md")',
+  '    try:',
+  '        with os.fdopen(fd, "w") as fh:',
+  '            fh.write(body)',
+  '        argv = ["issue", "create", "-R", REPO, "--title", title, "--body-file", tmp, "--label", "auto-filed"]',
+  '        if comp in COMPONENTS:',
+  '            argv += ["--label", comp]',
+  '        r = gh(argv)',
+  '    except Exception:',
+  '        r = None',
+  '    finally:',
+  '        if os.path.exists(tmp):',
+  '            os.remove(tmp)',
+  '    if r is None or r.returncode != 0:',
+  '        out["results"].append({"index": idx, "status": "failed"})',
+  '        continue',
+  '    filed += 1',
+  '    lines = (r.stdout or "").strip().splitlines()',
+  '    out["results"].append({"index": idx, "status": "filed", "url": lines[-1] if lines else ""})',
+  'print(json.dumps(out))'
+].join('\n')
+const FILE_SCHEMA = {
+  type: 'object',
+  required: ['ok', 'ghAvailable', 'results'],
+  additionalProperties: false,
+  properties: {
+    ok:          { type: 'boolean' },
+    ghAvailable: { type: 'boolean' },
+    results: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['index', 'status'],
+        additionalProperties: false,
+        properties: {
+          index:  { type: 'integer' },
+          status: { type: 'string' },
+          url:    { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+const AUTO_FILE_SDK_ISSUES = normalizedArgs.autoFileSdkIssues === true || normalizedArgs.autoFileSdkIssues === 'true'
+
+function originalFinding(c) {
+  return toCodeify.find(function(f) { return f.id === c.id && (!c.file || f.file === c.file) }) ||
+         toCodeify.find(function(f) { return f.id === c.id }) || null
+}
+
+// fixed-in-wave only when the quote is gone now AND was seen present earlier in this wave;
+// every other outcome (empty quote, never verified, bad path, untrusted result) is still-open.
+async function candidateStatuses(candidates) {
+  const statuses = candidates.map(function() { return 'still-open' })
+  const subjects = candidates.map(function(c) { return originalFinding(c) || c })
+  const items = subjects.map(function(s) { return { file: s.file, quote: s.quote } })
+  if (!items.some(function(it) { return typeof it.quote === 'string' && it.quote.trim() !== '' })) return statuses
+  const r = await runStaleScript(items, 'sdk:recheck', 'Codify')
+  if (!r) {
+    log('WARNING: SDK candidate re-check returned no trustworthy result — every candidate stays still-open')
+    return statuses
+  }
+  for (const i of r.stale) {
+    if (WAVE_VERIFIED_QUOTES.has(staleKey(subjects[i]))) statuses[i] = 'fixed-in-wave'
+  }
+  return statuses
+}
+
+async function fileStillOpenCandidates(candidates, statuses) {
+  const urls = {}
+  const open = []
+  candidates.forEach(function(c, i) {
+    if (statuses[i] === 'still-open') {
+      open.push({ index: i, description: c.description, component: c.component, severity: c.severity, file: c.file || '' })
+    }
+  })
+  if (open.length === 0) { log('autoFileSdkIssues: no still-open candidates to file'); return urls }
+  const r = await callAgent(
+    'Run this command at the repo root exactly as written (do not edit it) and return the JSON\n' +
+    'object it prints, field for field. If it fails to run, set ok=false, ghAvailable=false, results=[].\n\n' +
+    'python3 -c ' + shq(FILE_SDK_ISSUES_PY) + ' ' + shq(JSON.stringify({ waveId: wave.waveId, candidates: open })),
+    { schema: FILE_SCHEMA, label: 'sdk:file', phase: 'Codify', effort: 'low' }
+  )
+  if (!r || r.ok !== true || !Array.isArray(r.results)) {
+    log('WARNING: autoFileSdkIssues returned no trustworthy result — candidates stay in workspace/sdk-candidates.md for /sdk-issue-scan')
+    return urls
+  }
+  if (r.ghAvailable === false) log('WARNING: gh is unavailable or unauthenticated — candidates stay in workspace/sdk-candidates.md for /sdk-issue-scan')
+  r.results.forEach(function(x) {
+    if (x.url && (x.status === 'filed' || x.status === 'duplicate')) urls[x.index] = x.status + ': ' + x.url
+    if (x.status === 'skipped-secret') log('autoFileSdkIssues: candidate ' + (x.index + 1) + ' still matches a secret pattern after redaction — left for manual /sdk-issue-scan')
+  })
+  return urls
 }
 
 // ─── redteam fix loop (shared by unit and phase) ──────────────────────────────
@@ -1923,6 +2095,11 @@ if (toCodeify.length > 0) {
     'harness/skill | harness/workflow | harness/agent | harness/template |\n' +
     'sdk/build | sdk/loop | sdk/credentials | sdk/console |\n' +
     'protocol/a2a | protocol/mcp | protocol/ag-ui | protocol/a2ui | protocol/oauth | security\n\n' +
+    'Copy each candidate\'s finding id and quote UNCHANGED from the finding (you may rewrite the\n' +
+    'description, never id or quote).\n\n' +
+    'If this repo is the a2a-sdk repo itself (it has an agent_sdk/ package), EXCLUDE findings\n' +
+    'about the wave\'s own process: CHANGELOG entries, todo Creates:/scope declarations,\n' +
+    'template-mirror hygiene.\n\n' +
     'Findings to classify:\n' + JSON.stringify(toCodeify, null, 2),
     { schema: SDK_SCAN_SCHEMA, label: 'sdk:scan', phase: 'Codify' }
   )
@@ -1931,11 +2108,15 @@ if (toCodeify.length > 0) {
     log('WARNING: SDK issue scan returned null — this wave\'s findings were NOT classified; run /sdk-issue-scan by hand')
   } else if (sdkScan.sdkCandidates.length > 0) {
     sdkCandidatesCount = sdkScan.sdkCandidates.length
+    const statuses = await candidateStatuses(sdkScan.sdkCandidates)
+    const issueUrls = AUTO_FILE_SDK_ISSUES ? await fileStillOpenCandidates(sdkScan.sdkCandidates, statuses) : {}
     const candidateLines = sdkScan.sdkCandidates.map(function(c, i) {
       return '## Candidate ' + (i + 1) + ': ' + c.description + '\n' +
              '- Severity: ' + c.severity + '\n' +
              '- Component: ' + c.component + '\n' +
              '- File: ' + (c.file || 'n/a') + '\n' +
+             '- Status: ' + statuses[i] + '\n' +
+             (issueUrls[i] ? '- Issue: ' + issueUrls[i] + '\n' : '') +
              '- Rationale: ' + c.rationale
     }).join('\n\n')
 
@@ -1943,14 +2124,18 @@ if (toCodeify.length > 0) {
       'Write the file workspace/sdk-candidates.md with exactly this content:\n\n' +
       '# SDK issue candidates — ' + wave.waveId + ' (' + TODAY + ')\n\n' +
       'These critical/high findings from wave ' + wave.waveId + ' are classified as\n' +
-      'SDK-level. Run `/sdk-issue-scan` to review and file them as GitHub issues\n' +
-      'on `wailuen/a2a-sdk`. One confirmation per filing — nothing is filed automatically.\n\n' +
+      'SDK-level. Status is re-checked against the final tree: fixed-in-wave candidates were\n' +
+      'already fixed by this wave; run `/sdk-issue-scan` on the still-open ones to file them on\n' +
+      '`wailuen/a2a-sdk`. ' + (AUTO_FILE_SDK_ISSUES
+        ? 'autoFileSdkIssues was on: still-open candidates carry an Issue line when filed.'
+        : 'One confirmation per filing — nothing is filed automatically.') + '\n\n' +
       candidateLines,
       { label: 'sdk:candidates', phase: 'Codify', effort: 'low' }
     )
     if (!wrote) log('WARNING: workspace/sdk-candidates.md was not written (agent returned null)')
-    log('SDK issue candidates: ' + sdkScan.sdkCandidates.length + ' finding(s) written to workspace/sdk-candidates.md')
-    log('Run /sdk-issue-scan to file them as GitHub issues on wailuen/a2a-sdk')
+    log('SDK issue candidates: ' + sdkScan.sdkCandidates.length + ' finding(s) (' +
+        statuses.filter(function(s) { return s === 'still-open' }).length + ' still-open) written to workspace/sdk-candidates.md')
+    log('Run /sdk-issue-scan to file the still-open ones as GitHub issues on wailuen/a2a-sdk')
   } else {
     log('SDK issue scan: no SDK-level findings in this wave')
   }
