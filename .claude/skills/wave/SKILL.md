@@ -108,6 +108,23 @@ Execute one specific wave. Used for:
 - Running a manually created or edited wave file.
 - Jumping ahead when dependencies are already satisfied.
 
+**`[x]` vs `[~]` on a re-run (GH-278).** `[x]` means the todo is done: its work already landed, so
+the runner never dispatches it again (repeating pushes or live runs is the harm this prevents), but
+its `Creates:`/`Modifies:` paths stay in the wave scope and the archive gates still check them.
+`[~]` means the todo cannot land in this repo: it is skipped and its paths leave the scope.
+Never use `[~]` to mean "already done" (the scope empties and the run aborts with `empty-scope`).
+- All todos `[x]` (or `[~]`, with at least one `[x]`): the run resumes at archive. It skips plan
+  review, implement, redteam, protocol audit and codify, and runs only the pre-archive gate, the
+  archive-commit gate and the archive. Pass `resumeAt: "archive"` in the workflow args to force
+  this even with open `[ ]` todos; any other `resumeAt` value is rejected before any agent runs.
+- Some todos `[x]`, some `[ ]`: only the `[ ]` todos are dispatched. A group whose todos are all
+  `[x]` dispatches nothing but still passes the deliverable gate (a pattern `Creates:` path passes
+  when any matching file exists), and groups that depend on it run in the next tier. A mixed group
+  keeps the normal fresh-file gate for all its `Creates:` paths, so keep a `[x]` todo that owns a
+  pattern `Creates:` path in its own group.
+- A todo carrying an unreleased `HUMAN GATE:` marker still blocks the archive on every path.
+- Only the implementer ticks `[x]` (see `/implement`); do not tick a todo whose work has not landed.
+
 Steps:
 1. Resolve `workspace/todos/active/w<NNN>-*.md`.
 2. **Hard stop** if any `Depends:` item is not in `completed/` — report which dep is missing.
