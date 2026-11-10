@@ -71,7 +71,7 @@ const PYTEST = '$(test -x .venv/bin/python && echo .venv/bin/python || echo pyth
 // Filled verbatim from the preflight script's JSON (see PREFLIGHT_PY below).
 const PREFLIGHT_SCHEMA = {
   type: 'object',
-  required: ['ok', 'error', 'scopePaths', 'todoFacts'],
+  required: ['ok', 'error', 'freezeHash', 'scopePaths', 'todoFacts'],
   additionalProperties: false,
   properties: {
     ok:                       { type: 'boolean' },
@@ -83,15 +83,16 @@ const PREFLIGHT_SCHEMA = {
     dirtyPathCount:           { type: 'integer' },
     behindCount:              { type: 'integer' },
     lrnNext:                  { type: 'integer' },
+    freezeHash: { type: 'string', pattern: '^[0-9a-f]{64}$' },
     scopePaths:               { type: 'array', items: { type: 'string' }, description: 'The JSON list printed by the scope scan, unmodified' },
     todoFacts: {
       type: 'array',
       description: 'The JSON list printed by the todo scan, unmodified',
       items: {
         type: 'object',
-        required: ['id', 'dependsText', 'held', 'done'],
+        required: ['id', 'dependsText', 'held', 'done', 'skip'],
         additionalProperties: false,
-        properties: { id: { type: 'string' }, dependsText: { type: 'array', items: { type: 'string' } }, held: { type: 'boolean' }, done: { type: 'boolean' } },
+        properties: { id: { type: 'string' }, dependsText: { type: 'array', items: { type: 'string' } }, held: { type: 'boolean' }, done: { type: 'boolean' }, skip: { type: 'boolean' } },
       },
     },
   },
@@ -476,8 +477,9 @@ const SCOPE_SCAN_PY = [
 
 // Deterministic todo facts, read from the wave file itself (never from the model's relay of it):
 // per todo id, the raw text after each "Depends:" and whether an unreleased HUMAN GATE marker
-// holds it, and whether it is already ticked [x] (done). Todos marked [~] are skipped, matching
-// the scope scan; [x] todos are listed with done=true and keep their paths in scope.
+// holds it, whether it is already ticked [x] (done) and whether it is marked [~] (skip). Every
+// todo is listed, [~] ones included, so a [~] Depends: target can be told apart from a missing id;
+// consumers drop skip todos. [x] todos keep their paths in scope.
 const TODO_SCAN_PY = [
   'import json,re,sys',
   'TODO=re.compile(r"^\\s*[-*+]\\s*\\[(.)\\]\\s*"+chr(96)+r"([^"+chr(96)+r"]+)"+chr(96))',
@@ -485,10 +487,10 @@ const TODO_SCAN_PY = [
   'REL=re.compile(r"^\\s*(?:[-*+]\\s*)?(?:\\*\\*)?Release(?:\\*\\*)?\\s*:(?:\\*\\*)?[^\\n]*https://github\\.com/[\\w.-]+/[\\w.-]+/issues/\\d+",re.I|re.M)',
   'out=[]; cur=None',
   'def flush():',
-  '    if cur is None or cur["skip"]: return',
+  '    if cur is None: return',
   '    body="".join(cur["lines"])',
   '    dep=[m.group(1).strip() for l in cur["lines"] for m in [re.search(r"Depends:(?:\\*\\*)?\\s*(.*)$",l,re.I)] if m]',
-  '    out.append({"id":cur["id"],"dependsText":dep,"held":bool(GATE.search(body)) and not REL.search(body),"done":cur["done"]})',
+  '    out.append({"id":cur["id"],"dependsText":dep,"held":bool(GATE.search(body)) and not REL.search(body),"done":cur["done"],"skip":cur["skip"]})',
   'for l in open(sys.argv[1],encoding="utf-8"):',
   '    m=TODO.match(l)',
   '    if m:',
@@ -499,6 +501,42 @@ const TODO_SCAN_PY = [
   'flush()',
   'print(json.dumps(out))',
 ].join('\n')
+
+// Fingerprint of the wave file's structure, computed by this script and never by the model: per
+// todo (in file order, [~] included) its id, its "‖ group" label, its skip flag and its Depends:
+// lines. The [ ]/[x] tick and Creates:/Modifies: lines are left out, so the runner's own and
+// sanctioned edits do not change it. Same todo-line and block rules as TODO_SCAN_PY.
+const FREEZE_SCAN_PY = [
+  'import hashlib,json,re,sys',
+  'TODO=re.compile(r"^\\s*[-*+]\\s*\\[(.)\\]\\s*"+chr(96)+r"([^"+chr(96)+r"]+)"+chr(96))',
+  'GRP=re.compile(chr(8214)+r"\\s*group\\s*:\\s*([^\\s"+chr(96)+r"]+)")',
+  'out=[]; cur=None',
+  'def flush():',
+  '    if cur is None: return',
+  '    dep=[m.group(1).strip() for l in cur["lines"] for m in [re.search(r"Depends:(?:\\*\\*)?\\s*(.*)$",l,re.I)] if m]',
+  '    out.append([cur["id"],cur["grp"],cur["skip"],dep])',
+  'for l in open(sys.argv[1],encoding="utf-8"):',
+  '    m=TODO.match(l)',
+  '    if m:',
+  '        flush(); g=GRP.search(l); cur={"id":m.group(2).strip(),"grp":g.group(1) if g else "","skip":m.group(1)=="~","lines":[]}; continue',
+  '    if re.match(r"\\s*#{1,6}\\s",l):',
+  '        flush(); cur=None; continue',
+  '    if cur is not None: cur["lines"].append(l)',
+  'flush()',
+  'print(json.dumps({"ok":True,"hash":hashlib.sha256(json.dumps(out,sort_keys=True).encode()).hexdigest(),"todoCount":len(out)}))',
+].join('\n')
+
+const FREEZE_SCHEMA = {
+  type: 'object',
+  required: ['ok', 'hash', 'todoCount'],
+  additionalProperties: false,
+  properties: {
+    ok:        { type: 'boolean' },
+    hash:      { type: 'string', pattern: '^[0-9a-f]{64}$' },
+    todoCount: { type: 'integer' },
+    error:     { type: 'string' },
+  },
+}
 
 function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
 
@@ -640,10 +678,43 @@ function groupIsHeld(g) {
   return g.held === true
 }
 
-// Every todo the scan found is ticked [x] ([~] todos are not listed): a re-run after a blocked
+// Every live todo the scan found is ticked [x] ([~] todos are ignored): a re-run after a blocked
 // archive, where only the archive gates are left.
 function allTodosDone(facts) {
-  return facts.length > 0 && facts.every(function(f) { return f.done === true })
+  const live = facts.filter(function(f) { return f.skip !== true })
+  return live.length > 0 && live.every(function(f) { return f.done === true })
+}
+
+const HEX64 = /^[0-9a-f]{64}$/
+
+// Fingerprint of the wave file as it stands now; null unless the relay is trustworthy.
+async function readFreezeHash(label) {
+  const r = await callAgent(
+    'Run this command at the repo root exactly as written (do not edit it) and return the JSON\n' +
+    'object it prints, field for field. If it fails to run, set ok=false, hash to 64 zeros,\n' +
+    'todoCount to 0 and put its error text in error.\n\n' +
+    'python3 - ' + shq(WAVE_FILE) + " <<'FREEZE_SCAN'\n" + FREEZE_SCAN_PY + '\nFREEZE_SCAN',
+    { schema: FREEZE_SCHEMA, label: label, phase: lastDispatchedPhase, effort: 'low' }
+  )
+  if (r && r.ok === true && typeof r.hash === 'string' && HEX64.test(r.hash) &&
+      Number.isInteger(r.todoCount) && r.todoCount >= 0) return r.hash
+  return null
+}
+
+// The wave file is frozen once the preflight baseline is taken. Returns the error result that
+// stops the run, or null when the file still matches. Unknown is never unchanged.
+async function checkFreeze(label) {
+  const h = await readFreezeHash(label)
+  if (h === null) {
+    log('ERROR: wave-file freeze check ' + label + ' returned no trustworthy hash — stopping the run (freeze-check-failed)')
+    return { error: 'freeze-check-failed', waveId: wave.waveId, check: label }
+  }
+  if (h !== wave.freezeHash) {
+    log('ERROR: wave file changed since the run started (caught at ' + label + ') — stopping the run (wave-file-changed). ' +
+        'Edits to todos, ‖ group labels, Depends: lines or [~] marks are not allowed mid-run; re-run /wave ' + wave.waveId + '.')
+    return { error: 'wave-file-changed', waveId: wave.waveId, check: label }
+  }
+  return null
 }
 
 async function holdGroup(hg) {
@@ -873,11 +944,13 @@ phase('Parse')
 
 async function runPreflight(label) {
   const pf = await callAgent(
-    'Run the three commands below at the repo root exactly as written (do not edit them).\n' +
-    'Return the JSON object the first one prints, field for field, set scopePaths to the\n' +
-    'JSON list the second one prints, unmodified, and set todoFacts to the JSON list the third\n' +
-    'one prints, unmodified. If a command fails to run, set ok=false and\n' +
+    'Run the four commands below at the repo root, in the order written, exactly as written (do not edit them).\n' +
+    'Return the JSON object the PREFLIGHT command prints, field for field, set freezeHash to the\n' +
+    '"hash" the FREEZE_SCAN command prints, unmodified, set scopePaths to the JSON list the\n' +
+    'SCOPE_SCAN command prints, unmodified, and set todoFacts to the JSON list the TODO_SCAN\n' +
+    'command prints, unmodified. If a command fails to run, set ok=false and\n' +
     'put its error text in error.\n\n' +
+    'python3 - ' + shq(WAVE_FILE) + " <<'FREEZE_SCAN'\n" + FREEZE_SCAN_PY + '\nFREEZE_SCAN\n\n' +
     'python3 - ' + shq(WAVE_FILE) + " <<'PREFLIGHT'\n" + PREFLIGHT_PY + '\nPREFLIGHT\n\n' +
     'python3 - ' + shq(WAVE_FILE) + " <<'SCOPE_SCAN'\n" + SCOPE_SCAN_PY + '\nSCOPE_SCAN\n\n' +
     'python3 - ' + shq(WAVE_FILE) + " <<'TODO_SCAN'\n" + TODO_SCAN_PY + '\nTODO_SCAN',
@@ -886,8 +959,10 @@ async function runPreflight(label) {
   // Unknown state is never "nothing found": a failed or malformed preflight stops the wave.
   const wellFormed = pf && pf.ok === true &&
     Array.isArray(pf.scopePaths) && Array.isArray(pf.otherActiveWaves) &&
+    typeof pf.freezeHash === 'string' && /^[0-9a-f]{64}$/.test(pf.freezeHash) &&
     Array.isArray(pf.todoFacts) && pf.todoFacts.every(function(f) {
       return f && typeof f.id === 'string' && typeof f.held === 'boolean' && typeof f.done === 'boolean' &&
+        typeof f.skip === 'boolean' &&
         Array.isArray(f.dependsText) && f.dependsText.every(function(d) { return typeof d === 'string' })
     }) &&
     ['wrongRunnerForRepoLayout', 'completedFileExists', 'templateDirExists'].every(function(k) { return typeof pf[k] === 'boolean' }) &&
@@ -942,15 +1017,41 @@ async function parseWave(pf, label) {
   // a todo the scan found that the model's groups lack means Parse dropped text.
   const modelIds = new Set()
   w.groups.forEach(function(g) { g.todos.forEach(function(t) { modelIds.add(t && t.id) }) })
-  const unseen = pf.todoFacts.map(function(f) { return f.id }).filter(function(id) { return !modelIds.has(id) })
+  const unseen = pf.todoFacts.filter(function(f) { return !f.skip }).map(function(f) { return f.id }).filter(function(id) { return !modelIds.has(id) })
   if (unseen.length > 0) {
     log('ERROR: wave ' + w.waveId + ' Parse is missing ' + unseen.length + ' todo(s) the deterministic todo scan found: ' +
         unseen.join(', ') + ' — aborting rather than running with dropped Depends:/HUMAN GATE text. Re-run.')
     return { error: 'todo-scan-mismatch', waveId: w.waveId, missed: unseen }
   }
+  // Depends: ids are backticked todo ids. A todo that will still be dispatched must not name an
+  // id missing from the file or marked [~]; [x] targets count as met.
+  if (RESUME_AT !== 'archive') {
+    const known = new Set(pf.todoFacts.map(function(f) { return f.id }))
+    const skipped = new Set(pf.todoFacts.filter(function(f) { return f.skip }).map(function(f) { return f.id }))
+    const dangling = []
+    pf.todoFacts.filter(function(f) { return !f.skip && !f.done }).forEach(function(f) {
+      f.dependsText.forEach(function(text) {
+        const re = /`([^`]+)`/g
+        let m
+        while ((m = re.exec(text)) !== null) {
+          const id = m[1].trim()
+          // Only todo-id-shaped tokens count; backticked paths or names in a comment do not.
+          if (!/^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+$/.test(id) || !/\d/.test(id)) continue
+          if ((!known.has(id) || skipped.has(id)) && dangling.indexOf(id) === -1) dangling.push(id)
+        }
+      })
+    })
+    if (dangling.length > 0) {
+      log('ERROR: wave ' + w.waveId + ' has Depends: id(s) that match no live todo in the file (missing or marked [~]): ' +
+          dangling.join(', ') + ' — aborting before any implementer runs. Fix the Depends: line.')
+      return { error: 'dangling-depends', waveId: w.waveId, dangling: dangling }
+    }
+  }
   w.todoFacts   = pf.todoFacts
-  const heldIds = new Set(pf.todoFacts.filter(function(f) { return f.held }).map(function(f) { return f.id }))
-  const doneIds = new Set(pf.todoFacts.filter(function(f) { return f.done }).map(function(f) { return f.id }))
+  w.freezeHash  = pf.freezeHash
+  const liveFacts = pf.todoFacts.filter(function(f) { return !f.skip })
+  const heldIds = new Set(liveFacts.filter(function(f) { return f.held }).map(function(f) { return f.id }))
+  const doneIds = new Set(liveFacts.filter(function(f) { return f.done }).map(function(f) { return f.id }))
   w.groupDeps   = deriveGroupDeps(w)
   for (const g of w.groups) {
     g.creates  = uniq(g.creates)
@@ -1070,8 +1171,11 @@ log('Wave ' + wave.waveId + ': ' + wave.groups.length + ' group(s), ' +
 if (RESUME_AT === 'archive' || allTodosDone(preflight.todoFacts)) {
   log('Resuming at archive (' + (RESUME_AT === 'archive' ? 'args.resumeAt' : 'every todo is already done') +
       ') — skipping plan review, implement, redteam, protocol audit and codify')
+  const frozenResume = await checkFreeze('freeze:pre-archive')
+  if (frozenResume) return frozenResume
   for (const hg of wave.groups.filter(groupIsHeld)) await holdGroup(hg)
-  await runArchive()
+  const resumed = await runArchive(true)
+  if (resumed) return resumed
   return buildResult()
 }
 
@@ -1406,6 +1510,8 @@ function pruneDependents() {
 }
 
 while (remainingGroups.length > 0) {
+  const frozenTier = await checkFreeze('freeze:tier' + (tierNo + 1))
+  if (frozenTier) return frozenTier
   const heldNow = remainingGroups.filter(groupIsHeld)
   for (const hg of heldNow) {
     remainingGroups.splice(remainingGroups.indexOf(hg), 1)
@@ -2390,9 +2496,14 @@ if (registryCandidates.length > 0) {
   if (!registered) log('WARNING: component registration returned null — candidates were not registered')
 }
 
-async function runArchive() {
+async function runArchive(freezeChecked) {
 // ─── phase 7: archive ─────────────────────────────────────────────────────────
 phase('Archive')
+
+if (!freezeChecked) {
+  const frozen = await checkFreeze('freeze:pre-archive')
+  if (frozen) return frozen
+}
 
 // The suite must be green before the wave is marked complete; unknown is not green.
 const preArchiveGate = await runGate('gate:pre-archive', 'Archive')
@@ -2592,5 +2703,6 @@ function buildResult() {
   }
 }
 
-await runArchive()
+const archived = await runArchive()
+if (archived) return archived
 return buildResult()

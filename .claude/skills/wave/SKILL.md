@@ -125,6 +125,20 @@ Never use `[~]` to mean "already done" (the scope empties and the run aborts wit
 - A todo carrying an unreleased `HUMAN GATE:` marker still blocks the archive on every path.
 - Only the implementer ticks `[x]` (see `/implement`); do not tick a todo whose work has not landed.
 
+**The wave file is frozen during a run (GH-279).** The runner takes a fingerprint of the wave
+file at the first preflight (or the replan preflight when plan review edited it). The fingerprint
+covers each todo's id, its `‖ group:` label, its `Depends:` lines and whether it is `[~]`. It is
+checked before every tier and right before the pre-archive gate. Do not add todos or change those
+fields while a run is going. Exempt: plan-review fixes (made before the fingerprint is taken),
+`[ ]` to `[x]` ticks by the implementer, `Creates:`/`Modifies:` paths adopted by the scope re-scan,
+and the runner's own archive step.
+- `wave-file-changed`: the fingerprint no longer matches. No further agent runs. Finish the edit,
+  then re-run `/wave <id>`; the new run takes a fresh fingerprint (`[x]` todos are not repeated).
+- `freeze-check-failed`: the fingerprint could not be read (the check agent failed or returned a
+  malformed result). Unknown is treated as changed, so the run stops. Re-run `/wave <id>`.
+- `dangling-depends`: a todo still to run lists a backticked todo id in `Depends:` that is not in
+  the file or is marked `[~]`. Fix the `Depends:` line. A dependency on an `[x]` todo counts as met.
+
 Steps:
 1. Resolve `workspace/todos/active/w<NNN>-*.md`.
 2. **Hard stop** if any `Depends:` item is not in `completed/` — report which dep is missing.
