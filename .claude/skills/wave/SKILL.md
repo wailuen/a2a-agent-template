@@ -116,7 +116,17 @@ Never use `[~]` to mean "already done" (the scope empties and the run aborts wit
 - All todos `[x]` (or `[~]`, with at least one `[x]`): the run resumes at archive. It skips plan
   review, implement, redteam, protocol audit and codify, and runs only the pre-archive gate, the
   archive-commit gate and the archive. Pass `resumeAt: "archive"` in the workflow args to force
-  this even with open `[ ]` todos; any other `resumeAt` value is rejected before any agent runs.
+  this even with open `[ ]` todos (`resumeAt: null` counts as absent); any other `resumeAt` value
+  is rejected before any agent runs.
+- **The resume fails closed.** Because it skips review, it checks two things first (by script,
+  not by a model) and skips the archive with a logged reason if either fails. (1) Every blocking
+  note in `workspace/todos/deferred/<waveId>-*` must be resolved: `-budget-exhausted.md`,
+  `-rt-null-budget.md`, `-rt-mismatch-budget.md`, `-tests-red-*.md`, `-proto-tests-red.md` and `-gate-null-*.md`. A note counts as resolved
+  only when one of its lines starts with `Resolved:` (or `Resolved <date>:`) followed by text,
+  written after you fixed and verified the findings. `-medium-low.md` notes never block. (2) The
+  same `Creates:` deliverable gate the normal path runs for done groups (`deliv:resume`) must
+  pass. The result carries `resumeBlocked` and `resumeBlockedNotes`; an unreadable note check
+  counts as blocked.
 - Some todos `[x]`, some `[ ]`: only the `[ ]` todos are dispatched. A group whose todos are all
   `[x]` dispatches nothing but still passes the deliverable gate (a pattern `Creates:` path passes
   when any matching file exists), and groups that depend on it run in the next tier. A mixed group
@@ -127,8 +137,10 @@ Never use `[~]` to mean "already done" (the scope empties and the run aborts wit
 
 **The wave file is frozen during a run (GH-279).** The runner takes a fingerprint of the wave
 file at the first preflight (or the replan preflight when plan review edited it). The fingerprint
-covers each todo's id, its `‖ group:` label, its `Depends:` lines and whether it is `[~]`. It is
-checked before every tier and right before the pre-archive gate. Do not add todos or change those
+covers each todo's id, its `‖ group:` label, its `Depends:` lines, whether it is `[~]` and whether
+an unreleased `HUMAN GATE:` holds it (so adding a gate, or releasing one, mid-run stops the run).
+It is checked before every tier and right before the pre-archive gate, with no agent between that
+check and the gate. Do not add todos or change those
 fields while a run is going. Exempt: plan-review fixes (made before the fingerprint is taken),
 `[ ]` to `[x]` ticks by the implementer, `Creates:`/`Modifies:` paths adopted by the scope re-scan,
 and the runner's own archive step.
@@ -136,8 +148,12 @@ and the runner's own archive step.
   then re-run `/wave <id>`; the new run takes a fresh fingerprint (`[x]` todos are not repeated).
 - `freeze-check-failed`: the fingerprint could not be read (the check agent failed or returned a
   malformed result). Unknown is treated as changed, so the run stops. Re-run `/wave <id>`.
-- `dangling-depends`: a todo still to run lists a backticked todo id in `Depends:` that is not in
-  the file or is marked `[~]`. Fix the `Depends:` line. A dependency on an `[x]` todo counts as met.
+- `dangling-depends`: a todo still to run lists an id in `Depends:` that is not in the file or is
+  marked `[~]`. Write ids in backticks (`` `GH-12` ``, `` `P1b` ``). Bare ids with a hyphen and a
+  digit (`P0-01`) are checked too; bare words without a hyphen (`W4`) are read as prose. A `Depends:`
+  text that names another wave (`W0`, `w070`: "`P0-04` (W0 complete)") refers to todos outside this
+  file, so its bare ids are not checked. Fix the
+  `Depends:` line. A dependency on an `[x]` todo counts as met.
 
 Steps:
 1. Resolve `workspace/todos/active/w<NNN>-*.md`.
